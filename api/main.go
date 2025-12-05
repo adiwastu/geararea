@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -18,11 +19,19 @@ var db *pgxpool.Pool
 var jwtKey = []byte("verysecret")
 
 type User struct {
-	ID        int       `json:"id"`
-	Email     string    `json:"email"`
-	Pass      string    `json:"password,omitempty"`
-	Verified  bool      `json:"verified"`
-	CreatedAt time.Time `json:"created_at"`
+	ID             int       `json:"id"`
+	Email          string    `json:"email"`
+	Pass           string    `json:"password,omitempty"`
+	FullName       *string   `json:"full_name"`
+	Bio            *string   `json:"bio"`
+	ProfilePicture *string   `json:"profile_picture"`
+	Address        *string   `json:"address"`
+	AreaCode       *string   `json:"area_code"`
+	PayoutType     *string   `json:"payout_type"`
+	PayoutName     *string   `json:"payout_name"`
+	PayoutNumber   *string   `json:"payout_number"`
+	Verified       bool      `json:"verified"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 func main() {
@@ -41,6 +50,7 @@ func main() {
 
 	// protected
 	mux.Handle("/me", authMiddleware(http.HandlerFunc(meHandler)))
+	mux.Handle("/me/verified", authMiddleware(http.HandlerFunc(verifiedHandler)))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -161,14 +171,21 @@ func getMe(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value("userID").(int)
 
 	var u User
-	err := db.QueryRow(context.Background(),
-		`SELECT id, email, verified, created_at
-         FROM users WHERE id = $1`,
-		userID,
-	).Scan(&u.ID, &u.Email, &u.Verified, &u.CreatedAt)
+
+	query := `
+		SELECT id, email, full_name, bio, profile_picture, 
+		       address, area_code, payout_type, payout_name, payout_number, 
+		       verified, created_at
+		FROM users WHERE id = $1`
+
+	err := db.QueryRow(r.Context(), query, userID).Scan(
+		&u.ID, &u.Email, &u.FullName, &u.Bio, &u.ProfilePicture,
+		&u.Address, &u.AreaCode, &u.PayoutType, &u.PayoutName, &u.PayoutNumber,
+		&u.Verified, &u.CreatedAt,
+	)
 
 	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
+		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
 
@@ -178,41 +195,114 @@ func getMe(w http.ResponseWriter, r *http.Request) {
 
 func updateMe(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value("userID").(int)
-
 	var in User
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, "bad input", http.StatusBadRequest)
 		return
 	}
 
-	if in.Email != "" {
-		_, err := db.Exec(context.Background(),
-			`UPDATE users SET email = $1 WHERE id = $2`,
-			in.Email, userID,
-		)
-		if err != nil {
-			http.Error(w, "failed to update email", http.StatusInternalServerError)
-			return
-		}
+	// Dynamic Query Builder
+	// We only update fields that are present in the JSON
+	setParts := []string{}
+	args := []interface{}{}
+	argId := 1
+
+	// Helper to reduce repetition
+	add := func(col string, val interface{}) {
+		setParts = append(setParts, fmt.Sprintf("%s = $%d", col, argId))
+		args = append(args, val)
+		argId++
 	}
 
+	if in.Email != "" {
+		add("email", in.Email)
+	}
+	if in.FullName != nil {
+		add("full_name", *in.FullName)
+	}
+	if in.Bio != nil {
+		add("bio", *in.Bio)
+	}
+	if in.ProfilePicture != nil {
+		add("profile_picture", *in.ProfilePicture)
+	}
+	if in.Address != nil {
+		add("address", *in.Address)
+	}
+	if in.AreaCode != nil {
+		add("area_code", *in.AreaCode)
+	}
+	if in.PayoutType != nil {
+		add("payout_type", *in.PayoutType)
+	}
+	if in.PayoutName != nil {
+		add("payout_name", *in.PayoutName)
+	}
+	if in.PayoutNumber != nil {
+		add("payout_number", *in.PayoutNumber)
+	}
+
+	// Handle Password separately (hashing)
 	if in.Pass != "" {
 		hash, err := bcrypt.GenerateFromPassword([]byte(in.Pass), 12)
 		if err != nil {
-			http.Error(w, "internal server error", http.StatusInternalServerError)
+			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
+		add("password_hash", string(hash))
+	}
 
-		_, err = db.Exec(context.Background(),
-			`UPDATE users SET password_hash = $1 WHERE id = $2`,
-			string(hash), userID,
-		)
-		if err != nil {
-			http.Error(w, "failed to update password", http.StatusInternalServerError)
-			return
-		}
+	if len(setParts) == 0 {
+		w.WriteHeader(http.StatusOK) // Nothing to update
+		return
+	}
+
+	// Finalize Query: UPDATE users SET ... WHERE id = ...
+	query := fmt.Sprintf("UPDATE users SET %s WHERE id = $%d", strings.Join(setParts, ", "), argId)
+	args = append(args, userID)
+
+	_, err := db.Exec(r.Context(), query, args...)
+	if err != nil {
+		// In production, check for unique constraint violations (e.g. email)
+		http.Error(w, "update failed", http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status":"updated"}`))
+}
+
+func verifiedHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	if r.Method == http.MethodGet {
+		var verified bool
+		err := db.QueryRow(r.Context(), "SELECT verified FROM users WHERE id=$1", userID).Scan(&verified)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"verified": verified})
+		return
+	}
+
+	if r.Method == http.MethodPut {
+		var in struct {
+			Verified bool `json:"verified"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "bad input", http.StatusBadRequest)
+			return
+		}
+
+		_, err := db.Exec(r.Context(), "UPDATE users SET verified=$1 WHERE id=$2", in.Verified, userID)
+		if err != nil {
+			http.Error(w, "update failed", http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`{"status":"updated"}`))
+		return
+	}
+
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
