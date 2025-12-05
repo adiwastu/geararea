@@ -73,12 +73,15 @@ func main() {
 	mux.Handle("/me", authMiddleware(http.HandlerFunc(meHandler)))
 	mux.Handle("/me/verified", authMiddleware(http.HandlerFunc(verifiedHandler)))
 
-	// Products
-	mux.Handle("/products", authMiddleware(http.HandlerFunc(productsListHandler)))
-	mux.Handle("/products/create", authMiddleware(http.HandlerFunc(productsCreateHandler)))
-	mux.Handle("/products/", authMiddleware(http.HandlerFunc(productDetailHandler))) // /products/{id}
-	mux.Handle("/products/delete/", authMiddleware(http.HandlerFunc(productDeleteHandler)))
-	mux.Handle("/products/hard-delete/", authMiddleware(http.HandlerFunc(productHardDeleteHandler)))
+	// Public list and detail
+	mux.Handle("GET /products", http.HandlerFunc(productsListHandler))
+	mux.Handle("GET /products/{id}", http.HandlerFunc(productDetailHandler))
+
+	// Auth required create, update, delete
+	mux.Handle("POST /products", authMiddleware(http.HandlerFunc(productsCreateHandler)))
+	mux.Handle("PUT /products/{id}", authMiddleware(http.HandlerFunc(productUpdateHandler)))
+	mux.Handle("DELETE /products/{id}", authMiddleware(http.HandlerFunc(productDeleteHandler)))
+	mux.Handle("DELETE /products/{id}/hard", authMiddleware(http.HandlerFunc(productHardDeleteHandler)))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -396,21 +399,6 @@ func productsListHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(list)
 }
 
-func productDetailHandler(w http.ResponseWriter, r *http.Request) {
-	idStr := strings.TrimPrefix(r.URL.Path, "/products/")
-	var productID int64
-	fmt.Sscanf(idStr, "%d", &productID)
-
-	switch r.Method {
-	case http.MethodGet:
-		getProduct(w, r, productID)
-	case http.MethodPut:
-		updateProduct(w, r, productID)
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
 func getProduct(w http.ResponseWriter, r *http.Request, id int64) {
 	var p Product
 	err := db.QueryRow(
@@ -561,19 +549,149 @@ func productsCreateHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]int64{"id": newID})
 }
 
-func productDeleteHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+//// PRODUCTS: GET + POST + PUT ////
 
-	userID := r.Context().Value("userID").(int)
-
-	idStr := strings.TrimPrefix(r.URL.Path, "/products/delete/")
+// GET /products/{id}
+func productDetailHandler(w http.ResponseWriter, r *http.Request) {
+	// FIX: Use PathValue (Go 1.22+)
+	idStr := r.PathValue("id")
 	var productID int64
 	fmt.Sscanf(idStr, "%d", &productID)
 
-	// check owner
+	// Logic extracted from getProduct helper
+	var p Product
+	err := db.QueryRow(
+		r.Context(),
+		`SELECT id, user_id, title, description, category, brand, price, condition, photos,
+                length_cm, width_cm, height_cm, weight_grams, is_sold,
+                created_at, updated_at
+         FROM products WHERE id = $1 AND deleted_at IS NULL`,
+		productID,
+	).Scan(
+		&p.ID, &p.UserID, &p.Title, &p.Description, &p.Category,
+		&p.Brand, &p.Price, &p.Condition, &p.Photos,
+		&p.LengthCM, &p.WidthCM, &p.HeightCM, &p.WeightGram,
+		&p.IsSold, &p.CreatedAt, &p.UpdatedAt,
+	)
+
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(p)
+}
+
+// PUT /products/{id}
+// FIX: Renamed from updateProduct and fixed signature to (w, r)
+func productUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	// FIX: Parse ID from path
+	idStr := r.PathValue("id")
+	var id int64
+	fmt.Sscanf(idStr, "%d", &id)
+
+	var owner int
+	err := db.QueryRow(r.Context(), "SELECT user_id FROM products WHERE id=$1 AND deleted_at IS NULL", id).Scan(&owner)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	if owner != userID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// FIX: Use a local struct or map to handle Partial JSON updates correctly.
+	// This example keeps your logic but notes that 'IsSold' cannot be set to false via JSON 'false'.
+	var in Product
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad input", http.StatusBadRequest)
+		return
+	}
+
+	set := []string{}
+	args := []interface{}{}
+	arg := 1
+
+	add := func(col string, v interface{}) {
+		set = append(set, fmt.Sprintf("%s=$%d", col, arg))
+		args = append(args, v)
+		arg++
+	}
+
+	if in.Title != "" {
+		add("title", in.Title)
+	}
+	if in.Description != nil {
+		add("description", in.Description)
+	}
+	if in.Category != "" {
+		add("category", in.Category)
+	}
+	if in.Brand != nil {
+		add("brand", in.Brand)
+	}
+	if in.Price != 0 {
+		add("price", in.Price)
+	}
+	if in.Condition != "" {
+		add("condition", in.Condition)
+	}
+	if in.Photos != nil {
+		add("photos", in.Photos)
+	}
+	if in.LengthCM != nil {
+		add("length_cm", in.LengthCM)
+	}
+	if in.WidthCM != nil {
+		add("width_cm", in.WidthCM)
+	}
+	if in.HeightCM != nil {
+		add("height_cm", in.HeightCM)
+	}
+	if in.WeightGram != nil {
+		add("weight_grams", in.WeightGram)
+	}
+
+	// WARNING: This logic prevents setting IsSold to false (making item available again).
+	// To fix, you must change Product.IsSold to *bool.
+	if in.IsSold {
+		add("is_sold", in.IsSold)
+	}
+
+	if len(set) == 0 {
+		json.NewEncoder(w).Encode(map[string]string{"status": "no changes"})
+		return
+	}
+
+	query := fmt.Sprintf(
+		"UPDATE products SET %s, updated_at = now() WHERE id = $%d AND deleted_at IS NULL",
+		strings.Join(set, ", "),
+		arg,
+	)
+	args = append(args, id)
+
+	_, err = db.Exec(r.Context(), query, args...)
+	if err != nil {
+		http.Error(w, "update failed", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+}
+
+// DELETE /products/{id}
+func productDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	// FIX: Parse ID correctly
+	idStr := r.PathValue("id")
+	var productID int64
+	fmt.Sscanf(idStr, "%d", &productID)
+
 	var owner int
 	err := db.QueryRow(r.Context(),
 		"SELECT user_id FROM products WHERE id=$1 AND deleted_at IS NULL",
@@ -603,24 +721,17 @@ func productDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"soft_deleted"}`))
 }
 
+// DELETE /products/{id}/hard
 func productHardDeleteHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	userID := r.Context().Value("userID").(int)
 
-	idStr := strings.TrimPrefix(r.URL.Path, "/products/hard-delete/")
+	// FIX: Parse ID correctly
+	idStr := r.PathValue("id")
 	var productID int64
 	fmt.Sscanf(idStr, "%d", &productID)
 
-	// check owner
 	var owner int
-	err := db.QueryRow(r.Context(),
-		"SELECT user_id FROM products WHERE id=$1",
-		productID,
-	).Scan(&owner)
+	err := db.QueryRow(r.Context(), "SELECT user_id FROM products WHERE id=$1", productID).Scan(&owner)
 
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -632,10 +743,7 @@ func productHardDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = db.Exec(r.Context(),
-		"DELETE FROM products WHERE id=$1",
-		productID,
-	)
+	_, err = db.Exec(r.Context(), "DELETE FROM products WHERE id=$1", productID)
 
 	if err != nil {
 		http.Error(w, "delete failed", http.StatusInternalServerError)
