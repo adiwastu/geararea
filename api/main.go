@@ -34,6 +34,26 @@ type User struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+type Product struct {
+	ID          int64      `json:"id"`
+	UserID      int        `json:"user_id"`
+	Title       string     `json:"title"`
+	Description *string    `json:"description"`
+	Category    string     `json:"category"`
+	Brand       *string    `json:"brand"`
+	Price       int        `json:"price"`
+	Condition   string     `json:"condition"`
+	Photos      []string   `json:"photos"`
+	LengthCM    *int       `json:"length_cm"`
+	WidthCM     *int       `json:"width_cm"`
+	HeightCM    *int       `json:"height_cm"`
+	WeightGram  *int       `json:"weight_grams"`
+	IsSold      bool       `json:"is_sold"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	DeletedAt   *time.Time `json:"deleted_at"`
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -45,12 +65,20 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// Auth
 	mux.HandleFunc("POST /signup", signUp)
 	mux.HandleFunc("POST /signin", signIn)
 
-	// protected
+	// Me
 	mux.Handle("/me", authMiddleware(http.HandlerFunc(meHandler)))
 	mux.Handle("/me/verified", authMiddleware(http.HandlerFunc(verifiedHandler)))
+
+	// Products
+	mux.Handle("/products", authMiddleware(http.HandlerFunc(productsListHandler)))
+	mux.Handle("/products/create", authMiddleware(http.HandlerFunc(productsCreateHandler)))
+	mux.Handle("/products/", authMiddleware(http.HandlerFunc(productDetailHandler))) // /products/{id}
+	mux.Handle("/products/delete/", authMiddleware(http.HandlerFunc(productDeleteHandler)))
+	mux.Handle("/products/hard-delete/", authMiddleware(http.HandlerFunc(productHardDeleteHandler)))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -154,7 +182,7 @@ func signIn(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"token":"` + s + `"}`))
 }
 
-//// PROFILE: GET + UPDATE ////
+//// ME: GET + UPDATE ////
 
 func meHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -305,4 +333,314 @@ func verifiedHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+//// PRODUCTS: GET + POST + PUT ////
+
+func productsListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	page := 1
+	limit := 20
+
+	if p := r.URL.Query().Get("page"); p != "" {
+		fmt.Sscanf(p, "%d", &page)
+	}
+	if l := r.URL.Query().Get("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+	}
+
+	if page < 1 {
+		page = 1
+	}
+
+	offset := (page - 1) * limit
+
+	rows, err := db.Query(
+		r.Context(),
+		`SELECT id, user_id, title, description, category, brand, price, condition, photos,
+		        length_cm, width_cm, height_cm, weight_grams, is_sold,
+		        created_at, updated_at
+		 FROM products
+         WHERE deleted_at IS NULL
+		 ORDER BY created_at DESC
+		 LIMIT $1 OFFSET $2`, limit, offset,
+	)
+	if err != nil {
+		http.Error(w, "query failed", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	list := []Product{}
+
+	for rows.Next() {
+		var p Product
+		err := rows.Scan(
+			&p.ID, &p.UserID, &p.Title, &p.Description, &p.Category,
+			&p.Brand, &p.Price, &p.Condition, &p.Photos,
+			&p.LengthCM, &p.WidthCM, &p.HeightCM, &p.WeightGram,
+			&p.IsSold, &p.CreatedAt, &p.UpdatedAt,
+		)
+		if err != nil {
+			http.Error(w, "scan failed", http.StatusInternalServerError)
+			return
+		}
+		list = append(list, p)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func productDetailHandler(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/products/")
+	var productID int64
+	fmt.Sscanf(idStr, "%d", &productID)
+
+	switch r.Method {
+	case http.MethodGet:
+		getProduct(w, r, productID)
+	case http.MethodPut:
+		updateProduct(w, r, productID)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getProduct(w http.ResponseWriter, r *http.Request, id int64) {
+	var p Product
+	err := db.QueryRow(
+		r.Context(),
+		`SELECT id, user_id, title, description, category, brand, price, condition, photos,
+		        length_cm, width_cm, height_cm, weight_grams, is_sold,
+		        created_at, updated_at
+		 FROM products WHERE id = $1 AND deleted_at IS NULL`,
+		id,
+	).Scan(
+		&p.ID, &p.UserID, &p.Title, &p.Description, &p.Category,
+		&p.Brand, &p.Price, &p.Condition, &p.Photos,
+		&p.LengthCM, &p.WidthCM, &p.HeightCM, &p.WeightGram,
+		&p.IsSold, &p.CreatedAt, &p.UpdatedAt,
+	)
+
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(p)
+}
+
+func updateProduct(w http.ResponseWriter, r *http.Request, id int64) {
+	userID := r.Context().Value("userID").(int)
+
+	var owner int
+	err := db.QueryRow(r.Context(), "SELECT user_id FROM products WHERE id=$1 AND deleted_at IS NULL", id).Scan(&owner)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	if owner != userID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var in Product
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad input", http.StatusBadRequest)
+		return
+	}
+
+	set := []string{}
+	args := []interface{}{}
+	arg := 1
+
+	add := func(col string, v interface{}) {
+		set = append(set, fmt.Sprintf("%s=$%d", col, arg))
+		args = append(args, v)
+		arg++
+	}
+
+	if in.Title != "" {
+		add("title", in.Title)
+	}
+	if in.Description != nil {
+		add("description", in.Description)
+	}
+	if in.Category != "" {
+		add("category", in.Category)
+	}
+	if in.Brand != nil {
+		add("brand", in.Brand)
+	}
+	if in.Price != 0 {
+		add("price", in.Price)
+	}
+	if in.Condition != "" {
+		add("condition", in.Condition)
+	}
+	if in.Photos != nil {
+		add("photos", in.Photos)
+	}
+	if in.LengthCM != nil {
+		add("length_cm", in.LengthCM)
+	}
+	if in.WidthCM != nil {
+		add("width_cm", in.WidthCM)
+	}
+	if in.HeightCM != nil {
+		add("height_cm", in.HeightCM)
+	}
+	if in.WeightGram != nil {
+		add("weight_grams", in.WeightGram)
+	}
+	if in.IsSold {
+		add("is_sold", in.IsSold)
+	}
+
+	if len(set) == 0 {
+		json.NewEncoder(w).Encode(map[string]string{"status": "no changes"})
+		return
+	}
+
+	query := fmt.Sprintf(
+		"UPDATE products SET %s, updated_at = now() WHERE id = $%d AND deleted_at IS NULL",
+		strings.Join(set, ", "),
+		arg,
+	)
+
+	args = append(args, id)
+
+	_, err = db.Exec(r.Context(), query, args...)
+	if err != nil {
+		http.Error(w, "update failed", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+}
+
+func productsCreateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.Context().Value("userID").(int)
+
+	var in Product
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad input", http.StatusBadRequest)
+		return
+	}
+
+	var newID int64
+
+	err := db.QueryRow(
+		r.Context(),
+		`INSERT INTO products 
+		 (user_id, title, description, category, brand, price, condition, photos,
+		  length_cm, width_cm, height_cm, weight_grams)
+		 VALUES
+		 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		 RETURNING id`,
+		userID, in.Title, in.Description, in.Category, in.Brand, in.Price, in.Condition,
+		in.Photos, in.LengthCM, in.WidthCM, in.HeightCM, in.WeightGram,
+	).Scan(&newID)
+
+	if err != nil {
+		http.Error(w, "insert failed", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]int64{"id": newID})
+}
+
+func productDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.Context().Value("userID").(int)
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/products/delete/")
+	var productID int64
+	fmt.Sscanf(idStr, "%d", &productID)
+
+	// check owner
+	var owner int
+	err := db.QueryRow(r.Context(),
+		"SELECT user_id FROM products WHERE id=$1 AND deleted_at IS NULL",
+		productID,
+	).Scan(&owner)
+
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	if owner != userID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	_, err = db.Exec(r.Context(),
+		"UPDATE products SET deleted_at = now(), updated_at = now() WHERE id=$1 AND deleted_at IS NULL",
+		productID,
+	)
+
+	if err != nil {
+		http.Error(w, "delete failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Write([]byte(`{"status":"soft_deleted"}`))
+}
+
+func productHardDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.Context().Value("userID").(int)
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/products/hard-delete/")
+	var productID int64
+	fmt.Sscanf(idStr, "%d", &productID)
+
+	// check owner
+	var owner int
+	err := db.QueryRow(r.Context(),
+		"SELECT user_id FROM products WHERE id=$1",
+		productID,
+	).Scan(&owner)
+
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	if owner != userID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	_, err = db.Exec(r.Context(),
+		"DELETE FROM products WHERE id=$1",
+		productID,
+	)
+
+	if err != nil {
+		http.Error(w, "delete failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Write([]byte(`{"status":"hard_deleted"}`))
 }
