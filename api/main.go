@@ -7,7 +7,7 @@ import (
     "log"
     "net/http"
     "strings"
-
+    "time"
     "github.com/golang-jwt/jwt/v5"
     "github.com/jackc/pgx/v5/pgxpool"
     "golang.org/x/crypto/bcrypt"
@@ -21,7 +21,7 @@ type User struct {
     Email     string `json:"email"`
     Pass      string `json:"password,omitempty"`
     Verified  bool   `json:"verified"`
-    CreatedAt string `json:"created_at"`
+    CreatedAt time.Time `json:"created_at"`
 }
 
 func main() {
