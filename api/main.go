@@ -54,6 +54,31 @@ type Product struct {
 	DeletedAt   *time.Time `json:"deleted_at"`
 }
 
+type CartItem struct {
+	Product Product `json:"product"`
+}
+
+// CartGroup is for the JSON response: grouped by seller
+type CartGroup struct {
+	SellerID   int       `json:"seller_id"`
+	SellerName string    `json:"seller_name"`
+	Items      []Product `json:"items"`
+}
+
+type Order struct {
+	ID              int       `json:"id"`
+	BuyerID         int       `json:"buyer_id"`
+	SellerID        int       `json:"seller_id"`
+	Status          string    `json:"status"`
+	TotalPrice      int       `json:"total_price"`
+	ShippingCost    int       `json:"shipping_cost"`
+	AppFee          int       `json:"app_fee"`
+	GrandTotal      int       `json:"grand_total"`
+	ShippingAddress string    `json:"shipping_address"`
+	CreatedAt       time.Time `json:"created_at"`
+	// We can add payment details here if needed for frontend
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -82,6 +107,15 @@ func main() {
 	mux.Handle("PUT /products/{id}", authMiddleware(http.HandlerFunc(productUpdateHandler)))
 	mux.Handle("DELETE /products/{id}", authMiddleware(http.HandlerFunc(productDeleteHandler)))
 	mux.Handle("DELETE /products/{id}/hard", authMiddleware(http.HandlerFunc(productHardDeleteHandler)))
+
+	// Cart
+	mux.Handle("GET /cart", authMiddleware(http.HandlerFunc(cartListHandler)))
+	mux.Handle("POST /cart", authMiddleware(http.HandlerFunc(cartAddHandler)))
+	mux.Handle("DELETE /cart/{productID}", authMiddleware(http.HandlerFunc(cartRemoveHandler)))
+
+	// Orders
+	mux.Handle("POST /checkout", authMiddleware(http.HandlerFunc(checkoutHandler)))
+	mux.Handle("POST /orders/{id}/cancel", authMiddleware(http.HandlerFunc(orderCancelHandler)))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -751,4 +785,299 @@ func productHardDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write([]byte(`{"status":"hard_deleted"}`))
+}
+
+//// CART HANDLERS ////
+
+func cartAddHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	var in struct {
+		ProductID int `json:"product_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad input", http.StatusBadRequest)
+		return
+	}
+
+	// Check if product exists, is not sold, and NOT owned by user
+	var ownerID int
+	var isSold bool
+	err := db.QueryRow(r.Context(), "SELECT user_id, is_sold FROM products WHERE id=$1 AND deleted_at IS NULL", in.ProductID).Scan(&ownerID, &isSold)
+	if err != nil {
+		http.Error(w, "product not found", http.StatusNotFound)
+		return
+	}
+
+	if ownerID == userID {
+		http.Error(w, "cannot buy your own product", http.StatusBadRequest)
+		return
+	}
+	if isSold {
+		http.Error(w, "product is already sold", http.StatusBadRequest)
+		return
+	}
+
+	// Insert into cart (ignore duplicates via ON CONFLICT if needed, or let it error)
+	_, err = db.Exec(r.Context(),
+		`INSERT INTO cart_items (user_id, product_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		userID, in.ProductID,
+	)
+	if err != nil {
+		http.Error(w, "failed to add to cart", http.StatusInternalServerError)
+		return
+	}
+
+	w.Write([]byte(`{"status":"added"}`))
+}
+
+func cartRemoveHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+	idStr := r.PathValue("productID")
+
+	var productID int
+	fmt.Sscanf(idStr, "%d", &productID)
+
+	_, err := db.Exec(r.Context(), "DELETE FROM cart_items WHERE user_id=$1 AND product_id=$2", userID, productID)
+	if err != nil {
+		http.Error(w, "failed to remove", http.StatusInternalServerError)
+		return
+	}
+
+	w.Write([]byte(`{"status":"removed"}`))
+}
+
+func cartListHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	// Join products and users (to get seller name)
+	rows, err := db.Query(r.Context(), `
+        SELECT p.id, p.user_id, u.full_name, p.title, p.price, p.photos, p.is_sold
+        FROM cart_items c
+        JOIN products p ON c.product_id = p.id
+        JOIN users u ON p.user_id = u.id
+        WHERE c.user_id = $1 AND p.deleted_at IS NULL
+        ORDER BY p.user_id, p.created_at DESC
+    `, userID)
+	if err != nil {
+		http.Error(w, "query failed", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	// Grouping logic
+	// Map sellerID -> CartGroup
+	grouped := make(map[int]*CartGroup)
+	// To keep order consistent (optional), we could use a slice of IDs,
+	// but for simplicity we rely on the map for now.
+
+	for rows.Next() {
+		var p Product
+		var sellerID int
+		var sellerName *string // nullable in DB, but usually set
+
+		// We scan minimal fields for the cart view
+		err := rows.Scan(&p.ID, &sellerID, &sellerName, &p.Title, &p.Price, &p.Photos, &p.IsSold)
+		if err != nil {
+			continue
+		}
+
+		p.UserID = sellerID // Ensure struct has it
+
+		sName := "Unknown"
+		if sellerName != nil {
+			sName = *sellerName
+		}
+
+		if _, exists := grouped[sellerID]; !exists {
+			grouped[sellerID] = &CartGroup{
+				SellerID:   sellerID,
+				SellerName: sName,
+				Items:      []Product{},
+			}
+		}
+		grouped[sellerID].Items = append(grouped[sellerID].Items, p)
+	}
+
+	// Convert map to slice
+	res := []CartGroup{}
+	for _, g := range grouped {
+		res = append(res, *g)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
+//// CHECKOUT & ORDER HANDLERS ////
+
+func checkoutHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	var in struct {
+		SellerID int `json:"seller_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad input", http.StatusBadRequest)
+		return
+	}
+
+	// 1. Get Buyer Address (Snapshot)
+	var address *string
+	err := db.QueryRow(r.Context(), "SELECT address FROM users WHERE id=$1", userID).Scan(&address)
+	if err != nil || address == nil || *address == "" {
+		http.Error(w, "please set your shipping address in profile", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Start Transaction
+	tx, err := db.Begin(r.Context())
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	// 3. Lock & Fetch Cart Items for this Seller
+	// We use FOR UPDATE on the products table to prevent race conditions
+	rows, err := tx.Query(r.Context(), `
+        SELECT p.id, p.price 
+        FROM cart_items c
+        JOIN products p ON c.product_id = p.id
+        WHERE c.user_id = $1 AND p.user_id = $2 AND p.is_sold = false AND p.deleted_at IS NULL
+        FOR UPDATE OF p
+    `, userID, in.SellerID)
+	if err != nil {
+		http.Error(w, "failed to fetch items", http.StatusInternalServerError)
+		return
+	}
+
+	type itemToBuy struct {
+		ID    int64
+		Price int
+	}
+	items := []itemToBuy{}
+	totalPrice := 0
+
+	for rows.Next() {
+		var it itemToBuy
+		if err := rows.Scan(&it.ID, &it.Price); err != nil {
+			continue
+		}
+		items = append(items, it)
+		totalPrice += it.Price
+	}
+	rows.Close()
+
+	if len(items) == 0 {
+		http.Error(w, "no available items from this seller in cart", http.StatusBadRequest)
+		return
+	}
+
+	// 4. Create Order
+	// Hardcoded logic: AppFee is 1% or flat? Lets say flat 5000 for now or 0.
+	shippingCost := 0 // Will be calculated later via API
+	appFee := 0       // Calculate your cut here
+	grandTotal := totalPrice + shippingCost + appFee
+
+	var orderID int
+	err = tx.QueryRow(r.Context(), `
+        INSERT INTO orders 
+        (buyer_id, seller_id, status, total_price, shipping_cost, app_fee, grand_total, shipping_address)
+        VALUES ($1, $2, 'PENDING_PAYMENT', $3, $4, $5, $6, $7)
+        RETURNING id
+    `, userID, in.SellerID, totalPrice, shippingCost, appFee, grandTotal, *address).Scan(&orderID)
+
+	if err != nil {
+		http.Error(w, "failed to create order", http.StatusInternalServerError)
+		return
+	}
+
+	// 5. Process Items: Insert OrderItems + Mark Sold + Remove from Cart
+	for _, it := range items {
+		// A. Snapshot in order_items
+		_, err = tx.Exec(r.Context(),
+			"INSERT INTO order_items (order_id, product_id, price_at_purchase) VALUES ($1, $2, $3)",
+			orderID, it.ID, it.Price)
+		if err != nil {
+			return
+		}
+
+		// B. Mark as Sold (Inventory Reservation)
+		_, err = tx.Exec(r.Context(), "UPDATE products SET is_sold = true, updated_at = now() WHERE id = $1", it.ID)
+		if err != nil {
+			return
+		}
+
+		// C. Remove from Cart
+		_, err = tx.Exec(r.Context(), "DELETE FROM cart_items WHERE user_id = $1 AND product_id = $2", userID, it.ID)
+		if err != nil {
+			return
+		}
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		http.Error(w, "transaction commit failed", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "created",
+		"order_id":    orderID,
+		"grand_total": grandTotal,
+	})
+}
+
+func orderCancelHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+	idStr := r.PathValue("id")
+	var orderID int
+	fmt.Sscanf(idStr, "%d", &orderID)
+
+	tx, err := db.Begin(r.Context())
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	// 1. Verify Ownership & Status
+	var status string
+	err = tx.QueryRow(r.Context(), "SELECT status FROM orders WHERE id=$1 AND buyer_id=$2 FOR UPDATE", orderID, userID).Scan(&status)
+	if err != nil {
+		http.Error(w, "order not found or forbidden", http.StatusNotFound)
+		return
+	}
+
+	if status != "PENDING_PAYMENT" {
+		http.Error(w, "cannot cancel order in this state", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Update Order Status
+	_, err = tx.Exec(r.Context(), "UPDATE orders SET status='CANCELLED', updated_at=now() WHERE id=$1", orderID)
+	if err != nil {
+		http.Error(w, "update failed", http.StatusInternalServerError)
+		return
+	}
+
+	// 3. Release Inventory (Set is_sold = false)
+	// We join order_items to find which products to release
+	_, err = tx.Exec(r.Context(), `
+        UPDATE products 
+        SET is_sold = false, updated_at = now()
+        FROM order_items
+        WHERE products.id = order_items.product_id AND order_items.order_id = $1
+    `, orderID)
+	if err != nil {
+		http.Error(w, "failed to release inventory", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		http.Error(w, "commit failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Write([]byte(`{"status":"cancelled"}`))
 }
