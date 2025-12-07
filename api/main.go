@@ -88,6 +88,8 @@ func main() {
 	}
 	db = pool
 
+	initUploader()
+
 	mux := http.NewServeMux()
 
 	// Auth
@@ -116,6 +118,9 @@ func main() {
 	// Orders
 	mux.Handle("POST /checkout", authMiddleware(http.HandlerFunc(checkoutHandler)))
 	mux.Handle("POST /orders/{id}/cancel", authMiddleware(http.HandlerFunc(orderCancelHandler)))
+
+	// Media Upload
+	mux.Handle("POST /media/upload", authMiddleware(http.HandlerFunc(uploadHandler)))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -1080,4 +1085,32 @@ func orderCancelHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write([]byte(`{"status":"cancelled"}`))
+}
+
+//// MEDIA UPLOAD HANDLER ////
+
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	// Limit upload size (e.g., 10MB) to prevent RAM DoS
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, "file too big", http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("image") // Frontend must use key "image"
+	if err != nil {
+		http.Error(w, "invalid file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	url, err := processAndUpload(file, header)
+	if err != nil {
+		log.Printf("Upload Error: %v", err)
+		http.Error(w, "upload failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"url": url})
 }
