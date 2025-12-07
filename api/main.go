@@ -1113,4 +1113,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"url": url})
+
+	log.Printf("Content-Type: %s", r.Header.Get("Content-Type"))
+	log.Printf("Content-Length: %s", r.Header.Get("Content-Length"))
 }
