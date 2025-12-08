@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -17,21 +19,29 @@ import (
 
 var db *pgxpool.Pool
 var jwtKey = []byte("verysecret")
+var komshipAPIKey = os.Getenv("KOMSHIP_API_KEY")
 
 type User struct {
-	ID             int       `json:"id"`
-	Email          string    `json:"email"`
-	Pass           string    `json:"password,omitempty"`
-	FullName       *string   `json:"full_name"`
-	Bio            *string   `json:"bio"`
-	ProfilePicture *string   `json:"profile_picture"`
-	Address        *string   `json:"address"`
-	AreaCode       *string   `json:"area_code"`
-	PayoutType     *string   `json:"payout_type"`
-	PayoutName     *string   `json:"payout_name"`
-	PayoutNumber   *string   `json:"payout_number"`
-	Verified       bool      `json:"verified"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             int     `json:"id"`
+	Email          string  `json:"email"`
+	Pass           string  `json:"password,omitempty"`
+	FullName       *string `json:"full_name"`
+	Bio            *string `json:"bio"`
+	ProfilePicture *string `json:"profile_picture"`
+
+	// Updated Location Fields
+	Address    *string `json:"address"` // Street details (Jalan, RT/RW)
+	LocationID *int    `json:"location_id"`
+	Province   *string `json:"province"`
+	City       *string `json:"city"`
+	District   *string `json:"district"`
+	PostalCode *string `json:"postal_code"`
+
+	PayoutType   *string   `json:"payout_type"`
+	PayoutName   *string   `json:"payout_name"`
+	PayoutNumber *string   `json:"payout_number"`
+	Verified     bool      `json:"verified"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type Product struct {
@@ -121,6 +131,9 @@ func main() {
 
 	// Media Upload
 	mux.Handle("POST /media/upload", authMiddleware(http.HandlerFunc(uploadHandler)))
+
+	// Area search
+	mux.Handle("GET /locations/search", authMiddleware(http.HandlerFunc(searchLocationHandler)))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -242,15 +255,18 @@ func getMe(w http.ResponseWriter, r *http.Request) {
 
 	var u User
 
+	// Updated Query
 	query := `
-		SELECT id, email, full_name, bio, profile_picture, 
-		       address, area_code, payout_type, payout_name, payout_number, 
-		       verified, created_at
-		FROM users WHERE id = $1`
+        SELECT id, email, full_name, bio, profile_picture, 
+               address, location_id, province, city, district, postal_code,
+               payout_type, payout_name, payout_number, 
+               verified, created_at
+        FROM users WHERE id = $1`
 
 	err := db.QueryRow(r.Context(), query, userID).Scan(
 		&u.ID, &u.Email, &u.FullName, &u.Bio, &u.ProfilePicture,
-		&u.Address, &u.AreaCode, &u.PayoutType, &u.PayoutName, &u.PayoutNumber,
+		&u.Address, &u.LocationID, &u.Province, &u.City, &u.District, &u.PostalCode,
+		&u.PayoutType, &u.PayoutName, &u.PayoutNumber,
 		&u.Verified, &u.CreatedAt,
 	)
 
@@ -271,13 +287,10 @@ func updateMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dynamic Query Builder
-	// We only update fields that are present in the JSON
 	setParts := []string{}
 	args := []interface{}{}
 	argId := 1
 
-	// Helper to reduce repetition
 	add := func(col string, val interface{}) {
 		setParts = append(setParts, fmt.Sprintf("%s = $%d", col, argId))
 		args = append(args, val)
@@ -296,12 +309,27 @@ func updateMe(w http.ResponseWriter, r *http.Request) {
 	if in.ProfilePicture != nil {
 		add("profile_picture", *in.ProfilePicture)
 	}
+
+	// Address & Location Updates
 	if in.Address != nil {
 		add("address", *in.Address)
 	}
-	if in.AreaCode != nil {
-		add("area_code", *in.AreaCode)
+	if in.LocationID != nil {
+		add("location_id", *in.LocationID)
 	}
+	if in.Province != nil {
+		add("province", *in.Province)
+	}
+	if in.City != nil {
+		add("city", *in.City)
+	}
+	if in.District != nil {
+		add("district", *in.District)
+	}
+	if in.PostalCode != nil {
+		add("postal_code", *in.PostalCode)
+	}
+
 	if in.PayoutType != nil {
 		add("payout_type", *in.PayoutType)
 	}
@@ -312,7 +340,6 @@ func updateMe(w http.ResponseWriter, r *http.Request) {
 		add("payout_number", *in.PayoutNumber)
 	}
 
-	// Handle Password separately (hashing)
 	if in.Pass != "" {
 		hash, err := bcrypt.GenerateFromPassword([]byte(in.Pass), 12)
 		if err != nil {
@@ -323,17 +350,15 @@ func updateMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(setParts) == 0 {
-		w.WriteHeader(http.StatusOK) // Nothing to update
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Finalize Query: UPDATE users SET ... WHERE id = ...
 	query := fmt.Sprintf("UPDATE users SET %s WHERE id = $%d", strings.Join(setParts, ", "), argId)
 	args = append(args, userID)
 
 	_, err := db.Exec(r.Context(), query, args...)
 	if err != nil {
-		// In production, check for unique constraint violations (e.g. email)
 		http.Error(w, "update failed", http.StatusInternalServerError)
 		return
 	}
@@ -1116,4 +1141,54 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Content-Type: %s", r.Header.Get("Content-Type"))
 	log.Printf("Content-Length: %s", r.Header.Get("Content-Length"))
+}
+
+func searchLocationHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. Get query param
+	query := r.URL.Query().Get("q")
+	if len(query) < 3 {
+		http.Error(w, "query too short", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Prepare Request to Komship
+	// Endpoint: https://api.komship.com/v1/destination/domestic-destination?search=...
+	targetURL := fmt.Sprintf("https://api.komship.com/v1/destination/domestic-destination?search=%s", query)
+
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	// 3. Set Headers (Crucial for Komship)
+	// Check if key is present
+	if komshipAPIKey == "" {
+		// Fallback or Error if key is missing in Env
+		log.Println("ERROR: KOMSHIP_API_KEY is not set")
+		http.Error(w, "service configuration error", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+komshipAPIKey)
+	req.Header.Set("Accept", "application/json")
+
+	// 4. Execute
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "upstream api failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// 5. Proxy the Response back to frontend
+	// We copy the status code and the body directly
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+
+	// Efficiently stream the body without loading it all into memory
+	// (You can use io.Copy here since it's stdlib and simple)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Println("error copying response:", err)
+	}
 }
