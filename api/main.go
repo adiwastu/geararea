@@ -1169,7 +1169,7 @@ func searchLocationHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "service configuration error", http.StatusInternalServerError)
 		return
 	}
-	req.Header.Set("key", "Bearer "+komshipAPIKey)
+	req.Header.Set("key", komshipAPIKey)
 	req.Header.Set("Accept", "application/json")
 
 	// 4. Execute
