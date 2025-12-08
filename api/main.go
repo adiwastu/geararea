@@ -1152,8 +1152,8 @@ func searchLocationHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Prepare Request to Komship
-	// Endpoint: https://api.komship.com/v1/destination/domestic-destination?search=...
-	targetURL := fmt.Sprintf("https://api.komship.com/v1/destination/domestic-destination?search=%s", query)
+	// Endpoint: https://rajaongkir.komerce.id/api/v1/destination/domestic-destination?search=...
+	targetURL := fmt.Sprintf("https://rajaongkir.komerce.id/api/v1//destination/domestic-destination?search=%s", query)
 
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
