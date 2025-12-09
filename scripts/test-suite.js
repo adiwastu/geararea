@@ -641,12 +641,12 @@ async function main() {
         break;
       case '5':
         // Shipping requires Auth, Products, Cart setup, and Locations
-        await runFlow('Shipping', [authTests, productTests, cartTests, locationTests, shippingTests]);
+        await runFlow('Shipping', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests]);
         break;
       case '6':
         // Order requires Shipping setup usually, but for now just Cart
         // Note: Realistically checkout should fail if no address, so we include locationTests
-        await runFlow('Order', [authTests, productTests, cartTests, locationTests, orderTests]);
+        await runFlow('Order', [authTests, profileTests, productTests, cartTests, locationTests, orderTests]);
         break;
       case '7':
         await runFlow('Upload', [authTests, uploadTests]);
