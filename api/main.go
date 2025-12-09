@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -129,11 +130,15 @@ func main() {
 	mux.Handle("POST /checkout", authMiddleware(http.HandlerFunc(checkoutHandler)))
 	mux.Handle("POST /orders/{id}/cancel", authMiddleware(http.HandlerFunc(orderCancelHandler)))
 
-	// Media Upload
+	// Media upload
 	mux.Handle("POST /media/upload", authMiddleware(http.HandlerFunc(uploadHandler)))
 
 	// Area search
 	mux.Handle("GET /locations/search", authMiddleware(http.HandlerFunc(searchLocationHandler)))
+
+	// Shipping calculator
+	// Shipping Calculator
+	mux.Handle("POST /cart/shipping", authMiddleware(http.HandlerFunc(calculateShippingHandler)))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -1188,6 +1193,122 @@ func searchLocationHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Efficiently stream the body without loading it all into memory
 	// (You can use io.Copy here since it's stdlib and simple)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Println("error copying response:", err)
+	}
+}
+
+//// SHIPPING HANDLER ////
+
+func calculateShippingHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	// 1. Parse Input
+	var in struct {
+		SellerID int    `json:"seller_id"`
+		Courier  string `json:"courier"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad input", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Whitelist Check
+	// Supported couriers by Komerce/RajaOngkir
+	allowedCouriers := map[string]bool{
+		"jne": true, "sicepat": true, "ninja": true, "jnt": true,
+		"tiki": true, "wahana": true, "pos": true, "lion": true,
+	}
+	if !allowedCouriers[in.Courier] {
+		http.Error(w, "unsupported courier", http.StatusBadRequest)
+		return
+	}
+
+	// 3. Database "Triangulation" (Buyer Loc, Seller Loc, Weight)
+	var buyerLoc, sellerLoc *int
+	var totalWeight int
+
+	// A. Get Buyer Location
+	err := db.QueryRow(r.Context(), "SELECT location_id FROM users WHERE id = $1", userID).Scan(&buyerLoc)
+	if err != nil {
+		http.Error(w, "user not found", http.StatusInternalServerError)
+		return
+	}
+	if buyerLoc == nil {
+		http.Error(w, "please update your profile with a shipping address", http.StatusBadRequest)
+		return
+	}
+
+	// B. Get Seller Location
+	err = db.QueryRow(r.Context(), "SELECT location_id FROM users WHERE id = $1", in.SellerID).Scan(&sellerLoc)
+	if err != nil {
+		http.Error(w, "seller not found", http.StatusNotFound)
+		return
+	}
+	if sellerLoc == nil {
+		http.Error(w, "seller has not set a shipping location", http.StatusBadRequest)
+		return
+	}
+
+	// C. Calculate Weight
+	// Sum weight_grams of all products in cart for this seller
+	// COALESCE(..., 1000) ensures we default to 1kg if cart is empty or weights are missing
+	err = db.QueryRow(r.Context(), `
+		SELECT COALESCE(SUM(p.weight_grams), 1000) 
+		FROM cart_items c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.user_id = $1 AND p.user_id = $2
+	`, userID, in.SellerID).Scan(&totalWeight)
+
+	if err != nil {
+		// If query fails, fallback to 1kg so the API call doesn't break
+		log.Printf("Weight Calc Error: %v", err)
+		totalWeight = 1000
+	}
+	// Sanity check: ensure at least 1 gram
+	if totalWeight < 1 {
+		totalWeight = 1000
+	}
+
+	// 4. Call Komerce API
+	if komshipAPIKey == "" {
+		log.Println("ERROR: KOMSHIP_API_KEY is not set")
+		http.Error(w, "service configuration error", http.StatusInternalServerError)
+		return
+	}
+
+	// Build Form Data (application/x-www-form-urlencoded)
+	data := url.Values{}
+	data.Set("origin", fmt.Sprintf("%d", *sellerLoc))
+	data.Set("destination", fmt.Sprintf("%d", *buyerLoc))
+	data.Set("weight", fmt.Sprintf("%d", totalWeight))
+	data.Set("courier", in.Courier)
+
+	targetURL := "https://rajaongkir.komerce.id/api/v1/calculate/domestic-cost"
+	req, err := http.NewRequest("POST", targetURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Set Headers (Raw 'key' header, no Bearer)
+	req.Header.Set("key", komshipAPIKey)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("ERROR: Shipping API request failed: %v", err)
+		http.Error(w, "upstream api failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// 5. Proxy Response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream the JSON back to frontend
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Println("error copying response:", err)
 	}

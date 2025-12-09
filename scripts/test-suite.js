@@ -116,7 +116,7 @@ function createTestLogger() {
         passed++;
       } catch (err) {
         console.log(`[FAIL] ${name}`);
-        console.log(`       Error: ${err.message}`);
+        console.log(`      Error: ${err.message}`);
         failed++;
       }
     },
@@ -143,7 +143,7 @@ function assertEquals(actual, expected, message) {
   }
 }
 
-// ===== TEST SUITES (Each returns async function) =====
+// ===== TEST SUITES =====
 
 async function authTests(logger) {
   console.log('\n--- AUTH TESTS ---');
@@ -249,6 +249,7 @@ async function productTests(logger) {
       price: 15000,
       condition: 'excellent',
       photos: ['stand.jpg'],
+      weight_grams: 1200, // Important for shipping calc
     };
     const res = await makeRequest('POST', '/products', product, testState.seller.token);
     assertEquals(res.status, 200, 'Status should be 200');
@@ -370,6 +371,98 @@ async function cartTests(logger) {
     const res = await makeRequest('GET', '/cart', null, testState.buyer.token);
     assertEquals(res.status, 200, 'Status should be 200');
     assert(Array.isArray(res.body), 'Should return array');
+  });
+}
+
+async function locationTests(logger) {
+  console.log('\n--- LOCATION SEARCH & SAVE TESTS ---');
+
+  await logger.test('GET /locations/search: Search for location (Tebet)', async () => {
+    const res = await makeRequest('GET', '/locations/search?q=Tebet', null, testState.seller.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    const items = res.body.data || res.body;
+    assert(Array.isArray(items), 'Should return array of locations');
+    assert(items.length > 0, 'Should have at least one location');
+  });
+
+  await logger.test('PUT /me: Save location to seller profile', async () => {
+    const searchRes = await makeRequest('GET', '/locations/search?q=Tebet', null, testState.seller.token);
+    const items = searchRes.body.data || searchRes.body;
+    const location = items[0];
+    
+    const updatePayload = {
+      address: 'Jalan Seller Tebet No 1',
+      location_id: location.id,
+      province: location.province_name,
+      city: location.city_name || location.district_name,
+      district: location.subdistrict_name,
+      postal_code: location.zip_code,
+    };
+    
+    const res = await makeRequest('PUT', '/me', updatePayload, testState.seller.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    assert(res.body.status === 'updated', 'Should return updated status');
+  });
+}
+
+async function shippingTests(logger) {
+  console.log('\n--- SHIPPING CALCULATOR TESTS ---');
+
+  // Prerequisite: Ensure Buyer has a valid location for shipping calc to work
+  // We already set Seller location in locationTests, but we need to set Buyer too.
+  await logger.test('SETUP: Ensure Buyer has valid Location (Surabaya)', async () => {
+    // 1. Search
+    const searchRes = await makeRequest('GET', '/locations/search?q=Surabaya', null, testState.buyer.token);
+    const items = searchRes.body.data || searchRes.body;
+    assert(items.length > 0, 'Search for Surabaya failed');
+    const location = items[0];
+
+    // 2. Save
+    const updatePayload = {
+      address: 'Jalan Buyer Surabaya No 88',
+      location_id: location.id,
+      province: location.province_name,
+      city: location.city_name || location.district_name,
+      district: location.subdistrict_name,
+      postal_code: location.zip_code,
+    };
+
+    const res = await makeRequest('PUT', '/me', updatePayload, testState.buyer.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+  });
+
+  await logger.test('POST /cart/shipping: Calculate JNE Cost', async () => {
+    // Buyer checks shipping from Seller
+    const payload = {
+        seller_id: testState.seller.id,
+        courier: 'jne'
+    };
+
+    const res = await makeRequest('POST', '/cart/shipping', payload, testState.buyer.token);
+    
+    if (res.status !== 200) {
+        console.log('Shipping Error Body:', JSON.stringify(res.body, null, 2));
+    }
+    
+    assertEquals(res.status, 200, 'Status should be 200');
+    // Komerce returns { meta: {...}, data: [...] }
+    const results = res.body.data || res.body; 
+    assert(Array.isArray(results), 'Should return array of services');
+    assert(results.length > 0, 'Should return at least one service option');
+    
+    // Check structure of first result
+    const service = results[0];
+    assert(service.service !== undefined, 'Result should have service name');
+    assert(service.cost !== undefined, 'Result should have cost');
+  });
+
+  await logger.test('POST /cart/shipping: Fail unsupported courier', async () => {
+    const payload = {
+        seller_id: testState.seller.id,
+        courier: 'fedex' // Invalid
+    };
+    const res = await makeRequest('POST', '/cart/shipping', payload, testState.buyer.token);
+    assertEquals(res.status, 400, 'Status should be 400');
   });
 }
 
@@ -508,11 +601,13 @@ function displayMenu() {
   console.log('2. Profile Flow (get/update profile)');
   console.log('3. Product Flow (CRUD operations)');
   console.log('4. Cart Flow (add/list cart items)');
-  console.log('5. Order Flow (checkout + order management)');
-  console.log('6. Upload Flow (image upload)');
-  console.log('7. Error Cases (edge cases)');
-  console.log('8. Full Suite (all tests)');
-  console.log('0. Exit');
+  console.log('5. Shipping Flow (set locations + calc cost)');
+  console.log('6. Order Flow (checkout + order management)');
+  console.log('7. Upload Flow (image upload)');
+  console.log('8. Location Flow (search & save address)');
+  console.log('9. Error Cases (edge cases)');
+  console.log('0. Full Suite (all tests)');
+  console.log('X. Exit');
   console.log('='.repeat(60));
 }
 
@@ -529,7 +624,7 @@ async function main() {
   let running = true;
   while (running) {
     displayMenu();
-    const choice = await question('\nSelect a test flow (0-8): ');
+    const choice = (await question('\nSelect a test flow: ')).toUpperCase();
 
     switch (choice) {
       case '1':
@@ -545,18 +640,27 @@ async function main() {
         await runFlow('Cart', [authTests, productTests, cartTests]);
         break;
       case '5':
-        await runFlow('Order', [authTests, productTests, cartTests, orderTests]);
+        // Shipping requires Auth, Products, Cart setup, and Locations
+        await runFlow('Shipping', [authTests, productTests, cartTests, locationTests, shippingTests]);
         break;
       case '6':
-        await runFlow('Upload', [authTests, uploadTests]);
+        // Order requires Shipping setup usually, but for now just Cart
+        // Note: Realistically checkout should fail if no address, so we include locationTests
+        await runFlow('Order', [authTests, productTests, cartTests, locationTests, orderTests]);
         break;
       case '7':
-        await runFlow('Error Cases', [authTests, errorTests]);
+        await runFlow('Upload', [authTests, uploadTests]);
         break;
       case '8':
-        await runFlow('Full Suite', [authTests, profileTests, productTests, cartTests, orderTests, uploadTests, errorTests]);
+        await runFlow('Location', [authTests, locationTests]);
+        break;
+      case '9':
+        await runFlow('Error Cases', [authTests, errorTests]);
         break;
       case '0':
+        await runFlow('Full Suite', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests, orderTests, uploadTests, errorTests]);
+        break;
+      case 'X':
         console.log('Exiting test suite');
         running = false;
         break;
