@@ -7,8 +7,8 @@ const BASE_URL = 'https://api.geararea.net';
 const TIMESTAMP = Date.now();
 
 let testState = {
-  seller: { email: `seller_${TIMESTAMP}@test.com`, password: 'TestPass123!', token: null, id: null },
-  buyer: { email: `buyer_${TIMESTAMP}@test.com`, password: 'TestPass123!', token: null, id: null },
+  seller: { email: `seller_${TIMESTAMP}@test.com`, password: 'TestPass123!', username: `seller_${TIMESTAMP}`, token: null, id: null },
+  buyer: { email: `buyer_${TIMESTAMP}@test.com`, password: 'TestPass123!', username: `buyer_${TIMESTAMP}`, token: null, id: null },
   products: [],
   orders: [],
 };
@@ -348,6 +348,44 @@ async function productTests(logger) {
   });
 }
 
+async function shopTests(logger) {
+  console.log('\n--- STOREFRONT/SHOP TESTS ---');
+
+  // 1. Fetch Seller's Shop
+  await logger.test('GET /shops/{username}: Fetch seller storefront', async () => {
+    const username = testState.seller.username;
+    const res = await makeRequest('GET', `/shops/${username}`);
+    
+    assertEquals(res.status, 200, 'Status should be 200');
+    assertEquals(res.body.username, username, 'Username should match');
+    assertEquals(res.body.full_name, 'Test Seller', 'Full name should match profile update');
+    
+    // Check Inventory
+    // Note: In productTests, Seller added 3 items. 
+    // Item 1: Camera (Active)
+    // Item 2: Stand (Active)
+    // Item 4: Headphones (Soft Deleted)
+    // So we expect EXACTLY 2 items in the public shop.
+    const inventory = res.body.inventory || [];
+    assert(Array.isArray(inventory), 'Inventory should be an array');
+    
+    // Check that we don't see the soft-deleted item
+    // We assume productTests ran before this
+    if (testState.products.length >= 4) {
+        // Find the soft deleted ID
+        const deletedId = testState.products[3].id; 
+        const foundDeleted = inventory.find(p => p.id === deletedId);
+        assert(!foundDeleted, 'Soft deleted item should NOT appear in shop');
+    }
+  });
+
+  // 2. Fail on non-existent user
+  await logger.test('GET /shops/{username}: Fail for ghost user', async () => {
+    const res = await makeRequest('GET', '/shops/ghost_user_99999');
+    assertEquals(res.status, 404, 'Status should be 404');
+  });
+}
+
 async function cartTests(logger) {
   console.log('\n--- CART TESTS ---');
 
@@ -521,7 +559,8 @@ async function orderHistoryTests(logger) {
 
   await logger.test('GET /orders/{id}: Fail for Stranger (Security Check)', async () => {
     // 1. Create a random stranger
-    const stranger = { email: `stranger_${Date.now()}@test.com`, password: 'password123' };
+    const strangerTimestamp = Date.now();
+    const stranger = { email: `stranger_${Date.now()}@test.com`, password: 'password123', username: `stranger_${strangerTimestamp}`};
     await makeRequest('POST', '/signup', stranger);
     const login = await makeRequest('POST', '/signin', stranger);
     const token = login.body.token;
@@ -529,6 +568,44 @@ async function orderHistoryTests(logger) {
     // 2. Try to view the private order
     const res = await makeRequest('GET', `/orders/${orderId}`, null, token);
     assertEquals(res.status, 403, 'Should be 403 Forbidden');
+  });
+}
+
+async function savedTests(logger) {
+  console.log('\n--- SAVED ITEMS TESTS ---');
+
+  const productId = testState.products[0].id; // Use the first product
+
+  // 1. Toggle ON (Save)
+  await logger.test('POST /products/{id}/save: Save item', async () => {
+    const res = await makeRequest('POST', `/products/${productId}/save`, null, testState.buyer.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    assert(res.body.saved === true, 'Should return saved: true');
+  });
+
+  // 2. List Saved Items
+  await logger.test('GET /saved: List saved items', async () => {
+    const res = await makeRequest('GET', '/saved', null, testState.buyer.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    assert(Array.isArray(res.body), 'Should return array');
+    
+    const found = res.body.find(p => p.id === productId);
+    assert(found, 'Saved item should be in list');
+    assertEquals(found.title, testState.products[0].title, 'Title should match');
+  });
+
+  // 3. Toggle OFF (Unsave)
+  await logger.test('POST /products/{id}/save: Unsave item', async () => {
+    const res = await makeRequest('POST', `/products/${productId}/save`, null, testState.buyer.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    assert(res.body.saved === false, 'Should return saved: false');
+  });
+
+  // 4. Verify Removed
+  await logger.test('GET /saved: Verify item removed', async () => {
+    const res = await makeRequest('GET', '/saved', null, testState.buyer.token);
+    const found = res.body.find(p => p.id === productId);
+    assert(!found, 'Item should NOT be in list anymore');
   });
 }
 
@@ -615,9 +692,10 @@ async function errorTests(logger) {
 // ===== MAIN FLOW =====
 
 function resetTestState() {
+  const now = Date.now();
   testState = {
-    seller: { email: `seller_${Date.now()}@test.com`, password: 'TestPass123!', token: null, id: null },
-    buyer: { email: `buyer_${Date.now()}@test.com`, password: 'TestPass123!', token: null, id: null },
+    seller: { email: `seller_${now}@test.com`, password: 'TestPass123!', username: `seller_${now}`, token: null, id: null },
+    buyer: { email: `buyer_${now}@test.com`, password: 'TestPass123!', username: `buyer_${now}`, token: null, id: null },
     products: [],
     orders: [],
   };
@@ -656,8 +734,9 @@ function displayMenu() {
   console.log('7. Upload Flow (image upload)');
   console.log('8. Location Flow (search & save address)');
   console.log('9. Error Cases (edge cases)');
+  console.log('10. Storefront Flow (public profile)');
+  console.log('11. Save item');
   console.log('0. Full Suite (all tests)');
-  console.log('X. Exit');
   console.log('='.repeat(60));
 }
 
@@ -676,47 +755,68 @@ async function main() {
     displayMenu();
     const choice = (await question('\nSelect a test flow: ')).toUpperCase();
 
-    switch (choice) {
-      case '1':
-        await runFlow('Auth', [authTests]);
-        break;
-      case '2':
-        await runFlow('Profile', [authTests, profileTests]);
-        break;
-      case '3':
-        await runFlow('Product', [authTests, productTests]);
-        break;
-      case '4':
-        await runFlow('Cart', [authTests, productTests, cartTests]);
-        break;
-      case '5':
-        // Shipping requires Auth, Products, Cart setup, and Locations
-        await runFlow('Shipping', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests]);
-        break;
-      case '6':
-        // Order requires everything + checkout + history
-        await runFlow('Order', [authTests, profileTests, productTests, cartTests, locationTests, checkoutTests, orderHistoryTests]);
-        break;
-      case '7':
-        await runFlow('Upload', [authTests, uploadTests]);
-        break;
-      case '8':
-        await runFlow('Location', [authTests, locationTests]);
-        break;
-      case '9':
-        await runFlow('Error Cases', [authTests, errorTests]);
-        break;
-      case '0':
-        // The Grand Finale
-        await runFlow('Full Suite', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests, checkoutTests, orderHistoryTests, uploadTests, errorTests]);
-        break;
-      case 'X':
-        console.log('Exiting test suite');
-        running = false;
-        break;
-      default:
-        console.log('Invalid selection. Please try again.');
-    }
+  switch (choice) {
+        case '1':
+          await runFlow('Auth', [authTests]);
+          break;
+        case '2':
+          await runFlow('Profile', [authTests, profileTests]);
+          break;
+        case '3':
+          await runFlow('Product', [authTests, productTests]);
+          break;
+        case '4':
+          await runFlow('Cart', [authTests, productTests, cartTests]);
+          break;
+        case '5':
+          // Shipping requires Auth, Products, Cart setup, and Locations
+          await runFlow('Shipping', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests]);
+          break;
+        case '6':
+          // Order requires everything + checkout + history
+          await runFlow('Order', [authTests, profileTests, productTests, cartTests, locationTests, checkoutTests, orderHistoryTests]);
+          break;
+        case '7':
+          await runFlow('Upload', [authTests, uploadTests]);
+          break;
+        case '8':
+          await runFlow('Location', [authTests, locationTests]);
+          break;
+        case '9':
+          await runFlow('Error Cases', [authTests, errorTests]);
+          break;
+        case '10':
+          // Storefront requires Auth (to have a user) and Products (to show inventory)
+          await runFlow('Storefront', [authTests, profileTests, productTests, shopTests]);
+          break;
+        case '11':
+          // Saved Items requires Auth (buyer) and Products (to save)
+          await runFlow('Saved Items', [authTests, productTests, savedTests]);
+          break;
+        case '0':
+          // The Grand Finale - Now includes shopTests and savedTests
+          await runFlow('Full Suite', [
+              authTests, 
+              profileTests, 
+              productTests, 
+              cartTests, 
+              locationTests, 
+              shippingTests, 
+              checkoutTests, 
+              orderHistoryTests, 
+              shopTests, 
+              savedTests, // <--- Added here
+              uploadTests, 
+              errorTests
+          ]);
+          break;
+        case 'X':
+          console.log('Exiting test suite');
+          running = false;
+          break;
+        default:
+          console.log('Invalid selection. Please try again.');
+      }
 
     if (running) {
       await question('\nPress Enter to continue...');

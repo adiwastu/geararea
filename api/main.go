@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -239,6 +240,10 @@ func main() {
 
 	// Storefronts
 	mux.Handle("GET /shops/", http.HandlerFunc(shopHandler))
+
+	// Saved Items
+	mux.Handle("POST /products/{id}/save", authMiddleware(http.HandlerFunc(toggleSavedHandler)))
+	mux.Handle("GET /saved", authMiddleware(http.HandlerFunc(listSavedHandler)))
 
 	go StartJanitor(db)
 
@@ -1759,4 +1764,94 @@ func shopHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(shop)
+}
+
+// // SAVE HANDLER ////
+func toggleSavedHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(userIDKey).(int)
+
+	// Extract Product ID from URL
+	// Route: POST /products/{id}/save
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 3 {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	productIDStr := parts[len(parts)-2] // "save" is last, ID is second to last
+	productID, err := strconv.Atoi(productIDStr)
+	if err != nil {
+		http.Error(w, "invalid product id", http.StatusBadRequest)
+		return
+	}
+
+	// 1. Try to DELETE (Unsave)
+	// If the row exists, this deletes it and returns "1 row affected".
+	res, err := db.Exec(r.Context(), "DELETE FROM saved_items WHERE user_id = $1 AND product_id = $2", userID, productID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected := res.RowsAffected()
+
+	if rowsAffected > 0 {
+		// It existed and we deleted it.
+		json.NewEncoder(w).Encode(map[string]bool{"saved": false})
+		return
+	}
+
+	// 2. If DELETE did nothing, INSERT (Save)
+	// We use ON CONFLICT DO NOTHING just to be safe against race conditions
+	_, err = db.Exec(r.Context(), `
+		INSERT INTO saved_items (user_id, product_id) 
+		VALUES ($1, $2) 
+		ON CONFLICT DO NOTHING`,
+		userID, productID)
+
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]bool{"saved": true})
+}
+
+func listSavedHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(userIDKey).(int)
+
+	// We join with Products and Users (for seller name)
+	// We filter out Sold items if you want, or keep them marked as Sold.
+	// Usually, people want to keep seeing them to know they missed out.
+	query := `
+		SELECT p.id, p.title, p.price, p.condition, p.photos[1], u.username
+		FROM saved_items s
+		JOIN products p ON s.product_id = p.id
+		JOIN users u ON p.user_id = u.id
+		WHERE s.user_id = $1 AND p.deleted_at IS NULL
+		ORDER BY s.created_at DESC
+	`
+
+	rows, err := db.Query(r.Context(), query, userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var items []ProductPreview
+	for rows.Next() {
+		var p ProductPreview
+		// Reuse your existing ProductPreview struct!
+		if err := rows.Scan(&p.ID, &p.Title, &p.Price, &p.Condition, &p.Thumbnail, &p.SellerName); err == nil {
+			items = append(items, p)
+		}
+	}
+
+	// Handle empty list gracefully
+	if items == nil {
+		items = []ProductPreview{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(items)
 }
