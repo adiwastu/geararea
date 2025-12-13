@@ -8,17 +8,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// StartJanitor initiates the background worker.
-// It runs in a separate goroutine and wakes up periodically.
 func StartJanitor(db *pgxpool.Pool) {
-	// CONFIGURATION: How often does the janitor wake up?
-	// For Prod: Every 1 hour is usually fine.
-	// For Dev: You might want to shorten this to test it.
+	// CONFIGURATION
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
 	log.Println("🧹 Janitor started: Watching for stale orders...")
 
+	// FIX: Run the cleanup ONCE immediately when the app starts
+	runCleanup(db)
+
+	// Then continue with the periodic timer
 	for range ticker.C {
 		runCleanup(db)
 	}
