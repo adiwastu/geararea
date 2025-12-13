@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -22,10 +23,15 @@ var db *pgxpool.Pool
 var jwtKey = []byte("verysecret")
 var komshipAPIKey = os.Getenv("KOMSHIP_API_KEY")
 
+type contextKey string
+
+const userIDKey contextKey = "userID"
+
 type User struct {
 	ID             int     `json:"id"`
 	Email          string  `json:"email"`
 	Pass           string  `json:"password,omitempty"`
+	Username       string  `json:"username"`
 	FullName       *string `json:"full_name"`
 	Bio            *string `json:"bio"`
 	ProfilePicture *string `json:"profile_picture"`
@@ -142,6 +148,38 @@ type OrderItem struct {
 	Photo     *string `json:"photo"`
 }
 
+type ShopProfile struct {
+	ID             int              `json:"id"`
+	Username       string           `json:"username"`
+	FullName       string           `json:"full_name"`
+	ProfilePicture *string          `json:"profile_picture"`
+	Location       *string          `json:"location"` // City/District
+	JoinedAt       time.Time        `json:"joined_at"`
+	Inventory      []ProductPreview `json:"inventory"`
+}
+
+var reservedUsernames = map[string]bool{
+	// Auth & Account
+	"login": true, "signin": true, "signup": true, "register": true, "logout": true,
+	"password": true, "account": true, "settings": true, "profile": true, "dashboard": true,
+	"admin": true, "root": true, "superuser": true, "staff": true, "moderator": true,
+
+	// Commerce & App Structure
+	"cart": true, "checkout": true, "orders": true, "invoices": true,
+	"billing": true, "subscription": true, "payment": true, "shipping": true,
+	"shop": true, "store": true, "marketplace": true, "search": true,
+	"categories": true, "products": true, "items": true, "api": true,
+
+	// Content & Legal
+	"about": true, "contact": true, "blog": true, "news": true, "press": true,
+	"terms": true, "privacy": true, "legal": true, "faq": true, "help": true,
+	"support": true, "status": true, "jobs": true, "careers": true,
+
+	// Technical
+	"static": true, "assets": true, "public": true, "images": true, "css": true, "js": true,
+	"www": true, "http": true, "https": true, "null": true, "undefined": true,
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -199,6 +237,9 @@ func main() {
 	mux.Handle("GET /orders/selling", authMiddleware(http.HandlerFunc(listSellingHandler)))
 	mux.Handle("GET /orders/", authMiddleware(http.HandlerFunc(orderDetailHandler)))
 
+	// Storefronts
+	mux.Handle("GET /shops/", http.HandlerFunc(shopHandler))
+
 	go StartJanitor(db)
 
 	log.Println("API ready on :8080")
@@ -233,38 +274,94 @@ func authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), "userID", int(id))
+		ctx := context.WithValue(r.Context(), userIDKey, int(id))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 //// HANDLERS ////
 
+func isValidUsername(u string) error {
+	u = strings.ToLower(u)
+
+	// 1. Length Check
+	if len(u) < 3 {
+		return fmt.Errorf("username too short (min 3 chars)")
+	}
+	if len(u) > 30 {
+		return fmt.Errorf("username too long (max 30 chars)")
+	}
+
+	// 2. Format Check (Alphanumeric + Underscore only)
+	// Regex: ^[a-z0-9_]+$
+	validRegex := regexp.MustCompile(`^[a-z0-9_]+$`)
+	if !validRegex.MatchString(u) {
+		return fmt.Errorf("username can only contain letters, numbers, and underscores")
+	}
+
+	// 3. Blacklist Check
+	if reservedUsernames[u] {
+		return fmt.Errorf("this username is reserved")
+	}
+
+	return nil
+}
+
 func signUp(w http.ResponseWriter, r *http.Request) {
 	var u User
+	// 1. Decode JSON
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
 		http.Error(w, "bad input", http.StatusBadRequest)
 		return
 	}
 
+	// 2. VALIDATE USERNAME (The new logic)
+	// We enforce lowercase here immediately
+	u.Username = strings.ToLower(u.Username)
+
+	if err := isValidUsername(u.Username); err != nil {
+		// Return the specific validation error (e.g. "username taken", "too short")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 3. Hash Password
 	hash, err := bcrypt.GenerateFromPassword([]byte(u.Pass), 12)
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	_, err = db.Exec(context.Background(),
-		`INSERT INTO users (email, password_hash) VALUES ($1, $2)`,
-		u.Email, string(hash),
-	)
+	// 4. Insert into DB (Added 'username')
+	var newID int
+	err = db.QueryRow(context.Background(),
+		`INSERT INTO users (email, password_hash, username) VALUES ($1, $2, $3) RETURNING id`,
+		u.Email, string(hash), u.Username,
+	).Scan(&newID)
+
+	// 5. Handle Constraints (Duplicates)
 	if err != nil {
+		if strings.Contains(err.Error(), "users_username_key") {
+			http.Error(w, "username already taken", http.StatusConflict)
+			return
+		}
+		if strings.Contains(err.Error(), "users_email_key") {
+			http.Error(w, "email already registered", http.StatusConflict)
+			return
+		}
+		log.Printf("Signup Error: %v", err)
 		http.Error(w, "could not register user", http.StatusInternalServerError)
 		return
 	}
 
+	// 6. Success
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(`{"status":"created"}`))
+	// We return the ID now, it's helpful for the frontend
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "created",
+		"id":     newID,
+	})
 }
 
 func signIn(w http.ResponseWriter, r *http.Request) {
@@ -317,7 +414,7 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getMe(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	var u User
 
@@ -346,7 +443,7 @@ func getMe(w http.ResponseWriter, r *http.Request) {
 }
 
 func updateMe(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 	var in User
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, "bad input", http.StatusBadRequest)
@@ -434,7 +531,7 @@ func updateMe(w http.ResponseWriter, r *http.Request) {
 }
 
 func verifiedHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	if r.Method == http.MethodGet {
 		var verified bool
@@ -554,7 +651,7 @@ func getProduct(w http.ResponseWriter, r *http.Request, id int64) {
 }
 
 func updateProduct(w http.ResponseWriter, r *http.Request, id int64) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	var owner int
 	err := db.QueryRow(r.Context(), "SELECT user_id FROM products WHERE id=$1 AND deleted_at IS NULL", id).Scan(&owner)
@@ -649,7 +746,7 @@ func productsCreateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	var in Product
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -715,7 +812,7 @@ func productDetailHandler(w http.ResponseWriter, r *http.Request) {
 // PUT /products/{id}
 // FIX: Renamed from updateProduct and fixed signature to (w, r)
 func productUpdateHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	// FIX: Parse ID from path
 	idStr := r.PathValue("id")
@@ -815,7 +912,7 @@ func productUpdateHandler(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /products/{id}
 func productDeleteHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	// FIX: Parse ID correctly
 	idStr := r.PathValue("id")
@@ -853,7 +950,7 @@ func productDeleteHandler(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /products/{id}/hard
 func productHardDeleteHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	// FIX: Parse ID correctly
 	idStr := r.PathValue("id")
@@ -886,7 +983,7 @@ func productHardDeleteHandler(w http.ResponseWriter, r *http.Request) {
 //// CART HANDLERS ////
 
 func cartAddHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	var in struct {
 		ProductID int `json:"product_id"`
@@ -928,7 +1025,7 @@ func cartAddHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func cartRemoveHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 	idStr := r.PathValue("productID")
 
 	var productID int
@@ -944,7 +1041,7 @@ func cartRemoveHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func cartListHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	// Join products and users (to get seller name)
 	rows, err := db.Query(r.Context(), `
@@ -1008,7 +1105,7 @@ func cartListHandler(w http.ResponseWriter, r *http.Request) {
 //// CHECKOUT & ORDER HANDLERS ////
 
 func checkoutHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	var in struct {
 		SellerID int `json:"seller_id"`
@@ -1125,7 +1222,7 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func orderCancelHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 	idStr := r.PathValue("id")
 	var orderID int
 	fmt.Sscanf(idStr, "%d", &orderID)
@@ -1262,7 +1359,7 @@ func searchLocationHandler(w http.ResponseWriter, r *http.Request) {
 //// SHIPPING HANDLER ////
 
 func calculateShippingHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	// 1. Parse Input
 	var in struct {
@@ -1452,7 +1549,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 
 // // MY ORDERS HANDLER ////
 func listBuyingHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	// Query: Find orders where I am the BUYER. Join USERS to get Seller Name.
 	query := `
@@ -1495,7 +1592,7 @@ func listBuyingHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func listSellingHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	// Query: Find orders where I am the SELLER. Join USERS to get Buyer Name.
 	query := `
@@ -1537,7 +1634,7 @@ func listSellingHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func orderDetailHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(int)
+	userID := r.Context().Value(userIDKey).(int)
 
 	// Extract Order ID from URL (naive string trimming or regex)
 	// Assuming path is /orders/{id}
@@ -1602,4 +1699,64 @@ func orderDetailHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(o)
+}
+
+// // STOREFRONT SHOP HANDLER ////
+func shopHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract username from URL path
+	// Assuming route is /shops/{username}
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 3 {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	username := strings.ToLower(parts[len(parts)-1])
+
+	ctx := r.Context()
+	var shop ShopProfile
+
+	// 1. Fetch User ProfileM
+	// We only show safe public info
+	userQuery := `
+		SELECT id, username, COALESCE(full_name, 'New User'), profile_picture, city, created_at
+		FROM users 
+		WHERE username = $1
+	`
+	err := db.QueryRow(ctx, userQuery, username).Scan(
+		&shop.ID, &shop.Username, &shop.FullName, &shop.ProfilePicture, &shop.Location, &shop.JoinedAt,
+	)
+	if err != nil {
+		http.Error(w, "shop not found", http.StatusNotFound)
+		return
+	}
+
+	// 2. Fetch Active Inventory (Reusing the logic from Search/Products)
+	// Only show unsold, non-deleted items
+	prodQuery := `
+		SELECT id, title, price, condition, photos[1]
+		FROM products 
+		WHERE user_id = $1 AND is_sold = false AND deleted_at IS NULL
+		ORDER BY created_at DESC
+	`
+	rows, err := db.Query(ctx, prodQuery, shop.ID)
+	if err != nil {
+		// Log error but return the profile (empty inventory is fine)
+		log.Printf("Shop Inventory Error: %v", err)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var p ProductPreview
+			// Note: We don't need SellerName here since we know who owns the shop
+			if err := rows.Scan(&p.ID, &p.Title, &p.Price, &p.Condition, &p.Thumbnail); err == nil {
+				shop.Inventory = append(shop.Inventory, p)
+			}
+		}
+	}
+
+	if shop.Inventory == nil {
+		shop.Inventory = []ProductPreview{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(shop)
 }
