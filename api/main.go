@@ -111,6 +111,37 @@ type ProductPreview struct {
 	SellerName string  `json:"seller_name"`
 }
 
+type OrderPreview struct {
+	ID             int       `json:"id"`
+	Status         string    `json:"status"`
+	GrandTotal     int       `json:"grand_total"`
+	CreatedAt      time.Time `json:"created_at"`
+	Counterparty   string    `json:"counterparty"` // Seller Name (if buying) or Buyer Name (if selling)
+	FirstItemTitle string    `json:"first_item_title"`
+	FirstItemPhoto *string   `json:"first_item_photo"`
+	TotalItems     int       `json:"total_items"`
+}
+
+type OrderDetail struct {
+	ID              int         `json:"id"`
+	Status          string      `json:"status"`
+	BuyerName       string      `json:"buyer_name"`
+	SellerName      string      `json:"seller_name"`
+	ShippingAddress string      `json:"shipping_address"`
+	TrackingNumber  *string     `json:"tracking_number"`
+	GrandTotal      int         `json:"grand_total"`
+	ShippingCost    int         `json:"shipping_cost"`
+	CreatedAt       time.Time   `json:"created_at"`
+	Items           []OrderItem `json:"items"`
+}
+
+type OrderItem struct {
+	ProductID int     `json:"product_id"`
+	Title     string  `json:"title"`
+	Price     int     `json:"price"`
+	Photo     *string `json:"photo"`
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -162,6 +193,11 @@ func main() {
 
 	// Search
 	mux.Handle("GET /search", http.HandlerFunc(searchHandler))
+
+	// Order History
+	mux.Handle("GET /orders/buying", authMiddleware(http.HandlerFunc(listBuyingHandler)))
+	mux.Handle("GET /orders/selling", authMiddleware(http.HandlerFunc(listSellingHandler)))
+	mux.Handle("GET /orders/", authMiddleware(http.HandlerFunc(orderDetailHandler)))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -1410,4 +1446,158 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	// 4. Return JSON
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// // MY ORDERS HANDLER ////
+func listBuyingHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	// Query: Find orders where I am the BUYER. Join USERS to get Seller Name.
+	query := `
+		SELECT o.id, o.status, o.grand_total, o.created_at, u.full_name
+		FROM orders o
+		JOIN users u ON o.seller_id = u.id
+		WHERE o.buyer_id = $1
+		ORDER BY o.created_at DESC
+		LIMIT 50
+	`
+	rows, err := db.Query(r.Context(), query, userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var orders []OrderPreview
+	for rows.Next() {
+		var o OrderPreview
+		if err := rows.Scan(&o.ID, &o.Status, &o.GrandTotal, &o.CreatedAt, &o.Counterparty); err != nil {
+			continue
+		}
+
+		// Micro-Optimization: Get the first item's details for the "Preview Card"
+		// We do this inside the loop (N+1 query) which is acceptable for <50 items in Postgres.
+		_ = db.QueryRow(r.Context(), `
+			SELECT p.title, p.photos[1], (SELECT COUNT(*) FROM order_items WHERE order_id = $1)
+			FROM order_items oi
+			JOIN products p ON oi.product_id = p.id
+			WHERE oi.order_id = $1
+			LIMIT 1
+		`, o.ID).Scan(&o.FirstItemTitle, &o.FirstItemPhoto, &o.TotalItems)
+
+		orders = append(orders, o)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(orders)
+}
+
+func listSellingHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	// Query: Find orders where I am the SELLER. Join USERS to get Buyer Name.
+	query := `
+		SELECT o.id, o.status, o.grand_total, o.created_at, u.full_name
+		FROM orders o
+		JOIN users u ON o.buyer_id = u.id
+		WHERE o.seller_id = $1
+		ORDER BY o.created_at DESC
+		LIMIT 50
+	`
+	rows, err := db.Query(r.Context(), query, userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var orders []OrderPreview
+	for rows.Next() {
+		var o OrderPreview
+		if err := rows.Scan(&o.ID, &o.Status, &o.GrandTotal, &o.CreatedAt, &o.Counterparty); err != nil {
+			continue
+		}
+
+		// Get First Item Preview
+		_ = db.QueryRow(r.Context(), `
+			SELECT p.title, p.photos[1], (SELECT COUNT(*) FROM order_items WHERE order_id = $1)
+			FROM order_items oi
+			JOIN products p ON oi.product_id = p.id
+			WHERE oi.order_id = $1
+			LIMIT 1
+		`, o.ID).Scan(&o.FirstItemTitle, &o.FirstItemPhoto, &o.TotalItems)
+
+		orders = append(orders, o)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(orders)
+}
+
+func orderDetailHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("userID").(int)
+
+	// Extract Order ID from URL (naive string trimming or regex)
+	// Assuming path is /orders/{id}
+	pathParts := strings.Split(r.URL.Path, "/")
+	if len(pathParts) < 3 {
+		http.Error(w, "invalid order id", http.StatusBadRequest)
+		return
+	}
+	orderID := pathParts[len(pathParts)-1]
+
+	var o OrderDetail
+	var buyerID, sellerID int
+
+	// 1. Fetch Order Header & Verify Ownership
+	// We join twice to get BOTH names
+	query := `
+		SELECT o.id, o.status, o.grand_total, o.shipping_cost, o.shipping_address, o.tracking_number, o.created_at,
+		       o.buyer_id, o.seller_id,
+		       b.full_name, s.full_name
+		FROM orders o
+		JOIN users b ON o.buyer_id = b.id
+		JOIN users s ON o.seller_id = s.id
+		WHERE o.id = $1
+	`
+	err := db.QueryRow(r.Context(), query, orderID).Scan(
+		&o.ID, &o.Status, &o.GrandTotal, &o.ShippingCost, &o.ShippingAddress, &o.TrackingNumber, &o.CreatedAt,
+		&buyerID, &sellerID,
+		&o.BuyerName, &o.SellerName,
+	)
+
+	if err != nil {
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+
+	// SECURITY: Am I the buyer or the seller?
+	if userID != buyerID && userID != sellerID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// 2. Fetch Order Items
+	itemQuery := `
+		SELECT p.id, p.title, p.photos[1], oi.price_at_purchase
+		FROM order_items oi
+		JOIN products p ON oi.product_id = p.id
+		WHERE oi.order_id = $1
+	`
+	rows, err := db.Query(r.Context(), itemQuery, o.ID)
+	if err != nil {
+		// Log error but return what we have
+		log.Printf("Error fetching items: %v", err)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var i OrderItem
+			if err := rows.Scan(&i.ProductID, &i.Title, &i.Photo, &i.Price); err == nil {
+				o.Items = append(o.Items, i)
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(o)
 }
