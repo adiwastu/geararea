@@ -199,6 +199,8 @@ func main() {
 	mux.Handle("GET /orders/selling", authMiddleware(http.HandlerFunc(listSellingHandler)))
 	mux.Handle("GET /orders/", authMiddleware(http.HandlerFunc(orderDetailHandler)))
 
+	go StartJanitor(db)
+
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
 }

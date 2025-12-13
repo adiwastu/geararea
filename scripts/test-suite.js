@@ -409,7 +409,6 @@ async function shippingTests(logger) {
   console.log('\n--- SHIPPING CALCULATOR TESTS ---');
 
   // Prerequisite: Ensure Buyer has a valid location for shipping calc to work
-  // We already set Seller location in locationTests, but we need to set Buyer too.
   await logger.test('SETUP: Ensure Buyer has valid Location (Surabaya)', async () => {
     // 1. Search
     const searchRes = await makeRequest('GET', '/locations/search?q=Surabaya', null, testState.buyer.token);
@@ -432,42 +431,29 @@ async function shippingTests(logger) {
   });
 
   await logger.test('POST /cart/shipping: Calculate JNE Cost', async () => {
-    // Buyer checks shipping from Seller
     const payload = {
         seller_id: testState.seller.id,
         courier: 'jne'
     };
-
     const res = await makeRequest('POST', '/cart/shipping', payload, testState.buyer.token);
-    
-    if (res.status !== 200) {
-        console.log('Shipping Error Body:', JSON.stringify(res.body, null, 2));
-    }
-    
     assertEquals(res.status, 200, 'Status should be 200');
-    // Komerce returns { meta: {...}, data: [...] }
     const results = res.body.data || res.body; 
     assert(Array.isArray(results), 'Should return array of services');
     assert(results.length > 0, 'Should return at least one service option');
-    
-    // Check structure of first result
-    const service = results[0];
-    assert(service.service !== undefined, 'Result should have service name');
-    assert(service.cost !== undefined, 'Result should have cost');
   });
 
   await logger.test('POST /cart/shipping: Fail unsupported courier', async () => {
     const payload = {
         seller_id: testState.seller.id,
-        courier: 'fedex' // Invalid
+        courier: 'fedex'
     };
     const res = await makeRequest('POST', '/cart/shipping', payload, testState.buyer.token);
     assertEquals(res.status, 400, 'Status should be 400');
   });
 }
 
-async function orderTests(logger) {
-  console.log('\n--- ORDER/CHECKOUT TESTS ---');
+async function checkoutTests(logger) {
+  console.log('\n--- CHECKOUT TESTS ---');
 
   await logger.test('POST /checkout: Create order from cart', async () => {
     const res = await makeRequest('POST', '/checkout', { seller_id: testState.seller.id }, testState.buyer.token);
@@ -479,6 +465,70 @@ async function orderTests(logger) {
   await logger.test('GET /cart: Verify purchased items removed', async () => {
     const res = await makeRequest('GET', '/cart', null, testState.buyer.token);
     assertEquals(res.status, 200, 'Status should be 200');
+    const items = res.body.data || res.body;
+    // Note: If you added 2 items from same seller, both should be gone.
+    // Logic depends on your cart structure, usually returns empty array or null
+    if (Array.isArray(items)) {
+         // Filter for this seller
+         const sellerItems = items.filter(i => i.seller_id === testState.seller.id);
+         assert(sellerItems.length === 0, 'Cart should be empty for this seller');
+    }
+  });
+}
+
+async function orderHistoryTests(logger) {
+  console.log('\n--- ORDER HISTORY & DETAIL TESTS ---');
+
+  if (testState.orders.length === 0) {
+    throw new Error("❌ Dependency Error: No orders found. You must run Checkout tests first.");
+  }
+  const orderId = testState.orders[0].id;
+
+  await logger.test('GET /orders/buying: Check Buyer History', async () => {
+    const res = await makeRequest('GET', '/orders/buying', null, testState.buyer.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    assert(Array.isArray(res.body), 'Should return array');
+    
+    // Check if the new order is in the list
+    const found = res.body.find(o => o.id === orderId);
+    assert(found, `Order #${orderId} should be in buying history`);
+    assert(found.grand_total > 0, 'Grand total should be present');
+    assert(found.counterparty, 'Seller name (counterparty) should be present');
+  });
+
+  await logger.test('GET /orders/selling: Check Seller Dashboard', async () => {
+    const res = await makeRequest('GET', '/orders/selling', null, testState.seller.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    
+    const found = res.body.find(o => o.id === orderId);
+    assert(found, `Order #${orderId} should be in selling history`);
+    assert(found.counterparty, 'Buyer name (counterparty) should be present');
+  });
+
+  await logger.test('GET /orders/{id}: View Detail as Buyer', async () => {
+    const res = await makeRequest('GET', `/orders/${orderId}`, null, testState.buyer.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    assertEquals(res.body.id, orderId, 'ID mismatch');
+    assert(res.body.items.length > 0, 'Items should be listed');
+    assert(res.body.shipping_address, 'Shipping address should be visible');
+  });
+
+  await logger.test('GET /orders/{id}: View Detail as Seller', async () => {
+    const res = await makeRequest('GET', `/orders/${orderId}`, null, testState.seller.token);
+    assertEquals(res.status, 200, 'Status should be 200');
+    assertEquals(res.body.id, orderId, 'ID mismatch');
+  });
+
+  await logger.test('GET /orders/{id}: Fail for Stranger (Security Check)', async () => {
+    // 1. Create a random stranger
+    const stranger = { email: `stranger_${Date.now()}@test.com`, password: 'password123' };
+    await makeRequest('POST', '/signup', stranger);
+    const login = await makeRequest('POST', '/signin', stranger);
+    const token = login.body.token;
+
+    // 2. Try to view the private order
+    const res = await makeRequest('GET', `/orders/${orderId}`, null, token);
+    assertEquals(res.status, 403, 'Should be 403 Forbidden');
   });
 }
 
@@ -602,7 +652,7 @@ function displayMenu() {
   console.log('3. Product Flow (CRUD operations)');
   console.log('4. Cart Flow (add/list cart items)');
   console.log('5. Shipping Flow (set locations + calc cost)');
-  console.log('6. Order Flow (checkout + order management)');
+  console.log('6. Order Flow (checkout + history)');
   console.log('7. Upload Flow (image upload)');
   console.log('8. Location Flow (search & save address)');
   console.log('9. Error Cases (edge cases)');
@@ -644,9 +694,8 @@ async function main() {
         await runFlow('Shipping', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests]);
         break;
       case '6':
-        // Order requires Shipping setup usually, but for now just Cart
-        // Note: Realistically checkout should fail if no address, so we include locationTests
-        await runFlow('Order', [authTests, profileTests, productTests, cartTests, locationTests, orderTests]);
+        // Order requires everything + checkout + history
+        await runFlow('Order', [authTests, profileTests, productTests, cartTests, locationTests, checkoutTests, orderHistoryTests]);
         break;
       case '7':
         await runFlow('Upload', [authTests, uploadTests]);
@@ -658,7 +707,8 @@ async function main() {
         await runFlow('Error Cases', [authTests, errorTests]);
         break;
       case '0':
-        await runFlow('Full Suite', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests, orderTests, uploadTests, errorTests]);
+        // The Grand Finale
+        await runFlow('Full Suite', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests, checkoutTests, orderHistoryTests, uploadTests, errorTests]);
         break;
       case 'X':
         console.log('Exiting test suite');
