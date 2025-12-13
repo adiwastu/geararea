@@ -90,6 +90,27 @@ type Order struct {
 	// We can add payment details here if needed for frontend
 }
 
+type SearchResponse struct {
+	Users    []UserPreview    `json:"users"`
+	Products []ProductPreview `json:"products"`
+}
+
+type UserPreview struct {
+	ID             int     `json:"id"`
+	FullName       string  `json:"full_name"`
+	ProfilePicture *string `json:"profile_picture"`
+	Location       *string `json:"location,omitempty"` // District/City
+}
+
+type ProductPreview struct {
+	ID         int     `json:"id"`
+	Title      string  `json:"title"`
+	Price      int     `json:"price"`
+	Condition  string  `json:"condition"`
+	Thumbnail  *string `json:"thumbnail"` // First photo
+	SellerName string  `json:"seller_name"`
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -137,8 +158,10 @@ func main() {
 	mux.Handle("GET /locations/search", authMiddleware(http.HandlerFunc(searchLocationHandler)))
 
 	// Shipping calculator
-	// Shipping Calculator
 	mux.Handle("POST /cart/shipping", authMiddleware(http.HandlerFunc(calculateShippingHandler)))
+
+	// Search
+	mux.Handle("GET /search", http.HandlerFunc(searchHandler))
 
 	log.Println("API ready on :8080")
 	http.ListenAndServe(":8080", mux)
@@ -1312,4 +1335,79 @@ func calculateShippingHandler(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Println("error copying response:", err)
 	}
+}
+
+//// SEARCH HANDLER ////
+
+func searchHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. Parse Query
+	rawQuery := r.URL.Query().Get("q")
+	if len(rawQuery) < 2 { // Don't search for single letters
+		http.Error(w, "query too short", http.StatusBadRequest)
+		return
+	}
+
+	// Prepare the search term for ILIKE (e.g., "%ibanez%")
+	searchTerm := fmt.Sprintf("%%%s%%", rawQuery)
+
+	resp := SearchResponse{
+		Users:    []UserPreview{},
+		Products: []ProductPreview{},
+	}
+
+	// 2. SEARCH USERS (Shops)
+	// We use ILIKE which now uses the GIN Index we created!
+	userQuery := `
+		SELECT id, COALESCE(full_name, email), profile_picture, city 
+		FROM users 
+		WHERE full_name ILIKE $1 
+		LIMIT 5
+	`
+	uRows, err := db.Query(r.Context(), userQuery, searchTerm)
+	if err != nil {
+		log.Printf("Search Users Error: %v", err)
+		http.Error(w, "search failed", http.StatusInternalServerError)
+		return
+	}
+	defer uRows.Close()
+
+	for uRows.Next() {
+		var u UserPreview
+		// Note: We use COALESCE in SQL, so FullName won't be null
+		if err := uRows.Scan(&u.ID, &u.FullName, &u.ProfilePicture, &u.Location); err != nil {
+			continue
+		}
+		resp.Users = append(resp.Users, u)
+	}
+
+	// 3. SEARCH PRODUCTS (Gear)
+	// We search Title OR Description using the GIN indexes
+	prodQuery := `
+		SELECT p.id, p.title, p.price, p.condition, p.photos[1], COALESCE(u.full_name, 'Unknown')
+		FROM products p
+		JOIN users u ON p.user_id = u.id
+		WHERE (p.title ILIKE $1 OR p.description ILIKE $1 OR p.brand ILIKE $1)
+		AND p.is_sold = false 
+		AND p.deleted_at IS NULL
+		LIMIT 20
+	`
+	pRows, err := db.Query(r.Context(), prodQuery, searchTerm)
+	if err != nil {
+		log.Printf("Search Products Error: %v", err)
+		http.Error(w, "search failed", http.StatusInternalServerError)
+		return
+	}
+	defer pRows.Close()
+
+	for pRows.Next() {
+		var p ProductPreview
+		if err := pRows.Scan(&p.ID, &p.Title, &p.Price, &p.Condition, &p.Thumbnail, &p.SellerName); err != nil {
+			continue
+		}
+		resp.Products = append(resp.Products, p)
+	}
+
+	// 4. Return JSON
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
