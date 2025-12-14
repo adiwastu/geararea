@@ -157,7 +157,8 @@ func mockPayHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Fill Remaining Constants
-	kReq.OrderDate = time.Now().Format("2006-01-02 15:04:05")
+	jakartaTime := time.Now().UTC().Add(7 * time.Hour)
+	kReq.OrderDate = jakartaTime.Format("2006-01-02 15:04:05")
 	kReq.BrandName = "GearArea"
 	kReq.PaymentMethod = "BANK TRANSFER"
 	kReq.CodValue = 0 // Since it's bank transfer

@@ -537,6 +537,31 @@ async function checkoutTests(logger) {
   });
 }
 
+async function fulfillmentTests(logger) {
+  console.log('\n--- FULFILLMENT (PAYMENT + KOMERCE) TESTS ---');
+
+  if (testState.orders.length === 0) {
+    throw new Error('❌ Dependency Error: No orders found. Run Order tests first.');
+  }
+  const orderId = testState.orders[0].id;
+
+  // 1. MOCK PAY (Triggers Komerce)
+  await logger.test('POST /orders/{id}/pay: Mock Payment + Komerce Store', async () => {
+    const res = await makeRequest('POST', `/orders/${orderId}/pay`, {});
+    
+    // Log error if it fails (likely Komerce validation error)
+    if (res.status !== 200) {
+        console.log('Komerce Error:', JSON.stringify(res.body, null, 2));
+    }
+
+    assertEquals(res.status, 200, 'Status should be 200');
+    assert(res.body.status === 'paid', 'Status should be paid');
+    assert(res.body.komerce_id, 'Should return a Komerce ID (KOM...)');
+    
+    console.log(`   ✅ Komerce Order Created: ${res.body.komerce_id}`);
+  });
+}
+
 async function orderHistoryTests(logger) {
   console.log('\n--- ORDER HISTORY & DETAIL TESTS ---');
 
@@ -763,6 +788,7 @@ function displayMenu() {
   console.log('9. Error Cases (edge cases)');
   console.log('10. Storefront Flow (public profile)');
   console.log('11. Save item');
+  console.log('12. Fulfillment Flow (Pay + Komerce Sync)'); // <--- NEW
   console.log('0. Full Suite (all tests)');
   console.log('='.repeat(60));
 }
@@ -782,68 +808,81 @@ async function main() {
     displayMenu();
     const choice = (await question('\nSelect a test flow: ')).toUpperCase();
 
-  switch (choice) {
-        case '1':
-          await runFlow('Auth', [authTests]);
-          break;
-        case '2':
-          await runFlow('Profile', [authTests, profileTests]);
-          break;
-        case '3':
-          await runFlow('Product', [authTests, productTests]);
-          break;
-        case '4':
-          await runFlow('Cart', [authTests, productTests, cartTests]);
-          break;
-        case '5':
-          // Shipping requires Auth, Products, Cart setup, and Locations
-          await runFlow('Shipping', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests]);
-          break;
-        case '6':
-          // Order requires everything + checkout + history
-          await runFlow('Order', [authTests, profileTests, productTests, cartTests, locationTests, checkoutTests, orderHistoryTests]);
-          break;
-        case '7':
-          await runFlow('Upload', [authTests, uploadTests]);
-          break;
-        case '8':
-          await runFlow('Location', [authTests, locationTests]);
-          break;
-        case '9':
-          await runFlow('Error Cases', [authTests, errorTests]);
-          break;
-        case '10':
-          // Storefront requires Auth (to have a user) and Products (to show inventory)
-          await runFlow('Storefront', [authTests, profileTests, productTests, shopTests]);
-          break;
-        case '11':
-          // Saved Items requires Auth (buyer) and Products (to save)
-          await runFlow('Saved Items', [authTests, productTests, savedTests]);
-          break;
-        case '0':
-          // The Grand Finale - Now includes shopTests and savedTests
-          await runFlow('Full Suite', [
-              authTests, 
-              profileTests, 
-              productTests, 
-              cartTests, 
-              locationTests, 
-              shippingTests, 
-              checkoutTests, 
-              orderHistoryTests, 
-              shopTests, 
-              savedTests, // <--- Added here
-              uploadTests, 
-              errorTests
-          ]);
-          break;
-        case 'X':
-          console.log('Exiting test suite');
-          running = false;
-          break;
-        default:
-          console.log('Invalid selection. Please try again.');
-      }
+    switch (choice) {
+      case '1':
+        await runFlow('Auth', [authTests]);
+        break;
+      case '2':
+        await runFlow('Profile', [authTests, profileTests]);
+        break;
+      case '3':
+        await runFlow('Product', [authTests, productTests]);
+        break;
+      case '4':
+        await runFlow('Cart', [authTests, productTests, cartTests]);
+        break;
+      case '5':
+        // Shipping requires Auth, Products, Cart setup, and Locations
+        await runFlow('Shipping', [authTests, profileTests, productTests, cartTests, locationTests, shippingTests]);
+        break;
+      case '6':
+        // Order requires everything + checkout + history
+        await runFlow('Order', [authTests, profileTests, productTests, cartTests, locationTests, checkoutTests, orderHistoryTests]);
+        break;
+      case '7':
+        await runFlow('Upload', [authTests, uploadTests]);
+        break;
+      case '8':
+        await runFlow('Location', [authTests, locationTests]);
+        break;
+      case '9':
+        await runFlow('Error Cases', [authTests, errorTests]);
+        break;
+      case '10':
+        // Storefront requires Auth (to have a user) and Products (to show inventory)
+        await runFlow('Storefront', [authTests, profileTests, productTests, shopTests]);
+        break;
+      case '11':
+        // Saved Items requires Auth (buyer) and Products (to save)
+        await runFlow('Saved Items', [authTests, productTests, savedTests]);
+        break;
+      case '12':
+        // Fulfillment requires EVERYTHING (Order must exist to be paid)
+        await runFlow('Fulfillment', [
+            authTests, 
+            profileTests, 
+            productTests, 
+            cartTests, 
+            locationTests, 
+            checkoutTests, 
+            fulfillmentTests // <--- The new test
+        ]);
+        break;
+      case '0':
+        // The Grand Finale - Now includes fulfillment
+        await runFlow('Full Suite', [
+            authTests, 
+            profileTests, 
+            productTests, 
+            cartTests, 
+            locationTests, 
+            shippingTests, 
+            checkoutTests, 
+            orderHistoryTests, 
+            shopTests, 
+            savedTests, 
+            fulfillmentTests, // <--- Added here
+            uploadTests, 
+            errorTests
+        ]);
+        break;
+      case 'X':
+        console.log('Exiting test suite');
+        running = false;
+        break;
+      default:
+        console.log('Invalid selection. Please try again.');
+    }
 
     if (running) {
       await question('\nPress Enter to continue...');
