@@ -1112,19 +1112,32 @@ func cartListHandler(w http.ResponseWriter, r *http.Request) {
 func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(userIDKey).(int)
 
+	// MODIFICATION 1: Update Input Struct to accept Shipping Details
 	var in struct {
-		SellerID int `json:"seller_id"`
+		SellerID     int    `json:"seller_id"`
+		Courier      string `json:"courier"`       // e.g. "jne"
+		Service      string `json:"service"`       // e.g. "REG"
+		ShippingCost int    `json:"shipping_cost"` // e.g. 15000
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, "bad input", http.StatusBadRequest)
 		return
 	}
 
-	// 1. Get Buyer Address (Snapshot)
+	// Validate inputs
+	if in.ShippingCost < 0 {
+		http.Error(w, "invalid shipping cost", http.StatusBadRequest)
+		return
+	}
+
+	// MODIFICATION 2: Fetch 'location_id' along with address
+	// We need the numeric ID for the Komerce API later
 	var address *string
-	err := db.QueryRow(r.Context(), "SELECT address FROM users WHERE id=$1", userID).Scan(&address)
-	if err != nil || address == nil || *address == "" {
-		http.Error(w, "please set your shipping address in profile", http.StatusBadRequest)
+	var locationID *int
+	err := db.QueryRow(r.Context(), "SELECT address, location_id FROM users WHERE id=$1", userID).Scan(&address, &locationID)
+
+	if err != nil || address == nil || *address == "" || locationID == nil {
+		http.Error(w, "please set your shipping address and location in profile", http.StatusBadRequest)
 		return
 	}
 
@@ -1137,14 +1150,14 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 
 	// 3. Lock & Fetch Cart Items for this Seller
-	// We use FOR UPDATE on the products table to prevent race conditions
+	// (This logic remains EXACTLY the same)
 	rows, err := tx.Query(r.Context(), `
-        SELECT p.id, p.price 
-        FROM cart_items c
-        JOIN products p ON c.product_id = p.id
-        WHERE c.user_id = $1 AND p.user_id = $2 AND p.is_sold = false AND p.deleted_at IS NULL
-        FOR UPDATE OF p
-    `, userID, in.SellerID)
+		SELECT p.id, p.price 
+		FROM cart_items c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.user_id = $1 AND p.user_id = $2 AND p.is_sold = false AND p.deleted_at IS NULL
+		FOR UPDATE OF p
+	`, userID, in.SellerID)
 	if err != nil {
 		http.Error(w, "failed to fetch items", http.StatusInternalServerError)
 		return
@@ -1172,28 +1185,30 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Create Order
-	// Hardcoded logic: AppFee is 1% or flat? Lets say flat 5000 for now or 0.
-	shippingCost := 0 // Will be calculated later via API
-	appFee := 0       // Calculate your cut here
-	grandTotal := totalPrice + shippingCost + appFee
+	// MODIFICATION 3: Calculate Grand Total using real inputs
+	appFee := 0 // Still 0 for now
+	grandTotal := totalPrice + in.ShippingCost + appFee
 
+	// MODIFICATION 4: Insert with new Logistics Columns
 	var orderID int
 	err = tx.QueryRow(r.Context(), `
-        INSERT INTO orders 
-        (buyer_id, seller_id, status, total_price, shipping_cost, app_fee, grand_total, shipping_address)
-        VALUES ($1, $2, 'PENDING_PAYMENT', $3, $4, $5, $6, $7)
-        RETURNING id
-    `, userID, in.SellerID, totalPrice, shippingCost, appFee, grandTotal, *address).Scan(&orderID)
+		INSERT INTO orders 
+		(buyer_id, seller_id, status, total_price, shipping_cost, app_fee, grand_total, shipping_address,
+		 destination_location_id, shipping_provider, shipping_service)
+		VALUES ($1, $2, 'PENDING_PAYMENT', $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING id
+	`,
+		userID, in.SellerID, totalPrice, in.ShippingCost, appFee, grandTotal, *address,
+		locationID, in.Courier, in.Service, // <--- New Params
+	).Scan(&orderID)
 
 	if err != nil {
 		http.Error(w, "failed to create order", http.StatusInternalServerError)
 		return
 	}
 
-	// 5. Process Items: Insert OrderItems + Mark Sold + Remove from Cart
+	// 5. Process Items (Exact same logic as before)
 	for _, it := range items {
-		// A. Snapshot in order_items
 		_, err = tx.Exec(r.Context(),
 			"INSERT INTO order_items (order_id, product_id, price_at_purchase) VALUES ($1, $2, $3)",
 			orderID, it.ID, it.Price)
@@ -1201,13 +1216,11 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// B. Mark as Sold (Inventory Reservation)
 		_, err = tx.Exec(r.Context(), "UPDATE products SET is_sold = true, updated_at = now() WHERE id = $1", it.ID)
 		if err != nil {
 			return
 		}
 
-		// C. Remove from Cart
 		_, err = tx.Exec(r.Context(), "DELETE FROM cart_items WHERE user_id = $1 AND product_id = $2", userID, it.ID)
 		if err != nil {
 			return

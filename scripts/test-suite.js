@@ -494,9 +494,27 @@ async function checkoutTests(logger) {
   console.log('\n--- CHECKOUT TESTS ---');
 
   await logger.test('POST /checkout: Create order from cart', async () => {
-    const res = await makeRequest('POST', '/checkout', { seller_id: testState.seller.id }, testState.buyer.token);
+    // We simulate the data returned from the Shipping Calculator
+    const payload = { 
+        seller_id: testState.seller.id,
+        courier: 'jne',        // NEW
+        service: 'REG',        // NEW
+        shipping_cost: 15000   // NEW
+    };
+
+    const res = await makeRequest('POST', '/checkout', payload, testState.buyer.token);
+    
+    // Debugging info if it fails
+    if (res.status !== 200) {
+        console.log('Checkout Error:', JSON.stringify(res.body, null, 2));
+    }
+
     assertEquals(res.status, 200, 'Status should be 200');
     assert(res.body.order_id, 'Should return order_id');
+    // Verify Grand Total = Price + Shipping
+    // Product 1 (Camera) is 50,000 + 15,000 = 65,000
+    assertEquals(res.body.grand_total, 65000, 'Grand total should be product + shipping');
+    
     testState.orders.push({ id: res.body.order_id });
   });
 
@@ -504,10 +522,7 @@ async function checkoutTests(logger) {
     const res = await makeRequest('GET', '/cart', null, testState.buyer.token);
     assertEquals(res.status, 200, 'Status should be 200');
     const items = res.body.data || res.body;
-    // Note: If you added 2 items from same seller, both should be gone.
-    // Logic depends on your cart structure, usually returns empty array or null
     if (Array.isArray(items)) {
-         // Filter for this seller
          const sellerItems = items.filter(i => i.seller_id === testState.seller.id);
          assert(sellerItems.length === 0, 'Cart should be empty for this seller');
     }
@@ -597,7 +612,7 @@ async function savedTests(logger) {
       
       assertEquals(found.title, currentTitle, 'Title should match current product');
   });
-  
+
   // 3. Toggle OFF (Unsave)
   await logger.test('POST /products/{id}/save: Unsave item', async () => {
     const res = await makeRequest('POST', `/products/${productId}/save`, null, testState.buyer.token);
