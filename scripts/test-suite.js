@@ -583,17 +583,21 @@ async function savedTests(logger) {
     assert(res.body.saved === true, 'Should return saved: true');
   });
 
-  // 2. List Saved Items
   await logger.test('GET /saved: List saved items', async () => {
-    const res = await makeRequest('GET', '/saved', null, testState.buyer.token);
-    assertEquals(res.status, 200, 'Status should be 200');
-    assert(Array.isArray(res.body), 'Should return array');
-    
-    const found = res.body.find(p => p.id === productId);
-    assert(found, 'Saved item should be in list');
-    assertEquals(found.title, testState.products[0].title, 'Title should match');
+      const res = await makeRequest('GET', '/saved', null, testState.buyer.token);
+      assertEquals(res.status, 200, 'Status should be 200');
+      assert(Array.isArray(res.body), 'Should return array');
+      
+      const found = res.body.find(p => p.id === productId);
+      assert(found, 'Saved item should be in list');
+      
+      // DYNAMIC CHECK: Get current product title first
+      const productRes = await makeRequest('GET', `/products/${productId}`);
+      const currentTitle = productRes.body.title;
+      
+      assertEquals(found.title, currentTitle, 'Title should match current product');
   });
-
+  
   // 3. Toggle OFF (Unsave)
   await logger.test('POST /products/{id}/save: Unsave item', async () => {
     const res = await makeRequest('POST', `/products/${productId}/save`, null, testState.buyer.token);
