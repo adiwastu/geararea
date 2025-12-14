@@ -245,6 +245,9 @@ func main() {
 	mux.Handle("POST /products/{id}/save", authMiddleware(http.HandlerFunc(toggleSavedHandler)))
 	mux.Handle("GET /saved", authMiddleware(http.HandlerFunc(listSavedHandler)))
 
+	// Mock Payment Trigger (Calls Komerce)
+	mux.Handle("POST /orders/{id}/pay", http.HandlerFunc(mockPayHandler))
+
 	go StartJanitor(db)
 
 	log.Println("API ready on :8080")

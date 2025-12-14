@@ -494,12 +494,14 @@ async function checkoutTests(logger) {
   console.log('\n--- CHECKOUT TESTS ---');
 
   await logger.test('POST /checkout: Create order from cart', async () => {
+    // 1. Setup the Payload
     // We simulate the data returned from the Shipping Calculator
+    const shippingCost = 15000;
     const payload = { 
         seller_id: testState.seller.id,
-        courier: 'jne',        // NEW
-        service: 'REG',        // NEW
-        shipping_cost: 15000   // NEW
+        courier: 'jne',
+        service: 'REG',
+        shipping_cost: shippingCost
     };
 
     const res = await makeRequest('POST', '/checkout', payload, testState.buyer.token);
@@ -511,9 +513,15 @@ async function checkoutTests(logger) {
 
     assertEquals(res.status, 200, 'Status should be 200');
     assert(res.body.order_id, 'Should return order_id');
-    // Verify Grand Total = Price + Shipping
-    // Product 1 (Camera) is 50,000 + 15,000 = 65,000
-    assertEquals(res.body.grand_total, 65000, 'Grand total should be product + shipping');
+
+    // 2. Verify Grand Total Logic
+    // Item 1 (Camera): Updated to 45,000
+    // Item 2 (Stand): Created at 15,000
+    // Shipping: 15,000
+    // Expected: 45k + 15k + 15k = 75,000
+    const expectedTotal = 45000 + 15000 + shippingCost;
+    
+    assertEquals(res.body.grand_total, expectedTotal, `Grand total mismatch. Expected ${expectedTotal}, Got ${res.body.grand_total}`);
     
     testState.orders.push({ id: res.body.order_id });
   });
